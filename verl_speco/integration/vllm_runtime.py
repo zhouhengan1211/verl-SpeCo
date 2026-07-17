@@ -25,6 +25,7 @@ SPECO_VLLM_WORKER_EXTENSION_CLS = "verl_speco.integration.vllm_runtime.SpecoVLLM
 SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
+SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX = "_speco_vllm_request"
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
@@ -1095,6 +1096,162 @@ def patch_vllm_spec_decode_acceptance_logging() -> bool:
     return True
 
 
+def _speco_vllm_request_stats_store(scheduler: Any) -> dict[str, dict[str, int]]:
+    stats = getattr(scheduler, "_speco_vllm_request_accept_stats", None)
+    if not isinstance(stats, dict):
+        stats = {}
+        scheduler._speco_vllm_request_accept_stats = stats
+    return stats
+
+
+def _record_vllm_request_acceptance_stats(
+    scheduler: Any,
+    *,
+    request_id: Any,
+    num_draft_tokens: Any,
+    num_accepted_tokens: Any,
+    num_invalid_spec_tokens: Any,
+) -> None:
+    if request_id is None:
+        return
+    stats = _speco_vllm_request_stats_store(scheduler)
+    key = str(request_id)
+    item = stats.setdefault(
+        key,
+        {
+            "verify_rounds": 0,
+            "draft_tokens": 0,
+            "accepted_tokens": 0,
+            "invalid_spec_tokens": 0,
+        },
+    )
+    draft_tokens = _int_or_zero(num_draft_tokens)
+    accepted_tokens = _int_or_zero(num_accepted_tokens)
+    invalid_tokens = _int_or_zero(num_invalid_spec_tokens)
+    if draft_tokens <= 0 and accepted_tokens <= 0 and invalid_tokens <= 0:
+        return
+    item["verify_rounds"] += 1
+    item["draft_tokens"] += draft_tokens
+    item["accepted_tokens"] += accepted_tokens
+    item["invalid_spec_tokens"] += invalid_tokens
+
+
+def _request_ids_from_scheduler_output(output: Any) -> list[str]:
+    candidates = []
+    for name in ("finished_req_ids", "finished_request_ids", "finished_requests", "request_ids"):
+        value = getattr(output, name, None)
+        if value is not None:
+            candidates.append(value)
+    request_outputs = getattr(output, "request_outputs", None) or getattr(output, "outputs", None)
+    if isinstance(request_outputs, dict):
+        candidates.append(request_outputs.keys())
+    elif isinstance(request_outputs, (list, tuple)):
+        candidates.append([getattr(item, "request_id", None) for item in request_outputs])
+
+    request_ids: list[str] = []
+    for candidate in candidates:
+        if isinstance(candidate, (str, bytes)):
+            values = [candidate]
+        else:
+            try:
+                values = list(candidate)
+            except TypeError:
+                values = [candidate]
+        for value in values:
+            if value is not None:
+                request_ids.append(str(value))
+    return list(dict.fromkeys(request_ids))
+
+
+def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
+    stats = getattr(scheduler, "_speco_vllm_request_accept_stats", None)
+    if not isinstance(stats, dict) or not stats:
+        return
+    request_ids = _request_ids_from_scheduler_output(output)
+    if not request_ids:
+        return
+    summaries = {}
+    for request_id in request_ids:
+        item = stats.pop(str(request_id), None)
+        if item is not None:
+            summaries[str(request_id)] = dict(item)
+    if not summaries:
+        return
+    try:
+        setattr(output, "_speco_vllm_request_accept_stats", summaries)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def patch_vllm_request_acceptance_stats() -> bool:
+    """Carry request-level speculative acceptance summaries on scheduler outputs.
+
+    The exact vLLM output classes differ across 0.23-era commits, so this patch
+    records stable integer counters in ``Scheduler.make_spec_decoding_stats`` and
+    best-effort attaches completed request summaries to the scheduler output.
+    Downstream SPECO collection treats the fields as optional and preserves the
+    old collect plan when they are absent.
+    """
+
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM request acceptance stats patch: %s", exc)
+        return False
+
+    original_make_stats = getattr(Scheduler, "make_spec_decoding_stats", None)
+    if callable(original_make_stats) and not getattr(original_make_stats, "_speco_request_acceptance_stats", False):
+
+        def patched_make_spec_decoding_stats(
+            self,
+            spec_decoding_stats,
+            num_draft_tokens,
+            num_accepted_tokens,
+            num_invalid_spec_tokens,
+            request_id,
+        ):
+            result = original_make_stats(
+                self,
+                spec_decoding_stats,
+                num_draft_tokens,
+                num_accepted_tokens,
+                num_invalid_spec_tokens,
+                request_id,
+            )
+            try:
+                _record_vllm_request_acceptance_stats(
+                    self,
+                    request_id=request_id,
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted_tokens,
+                    num_invalid_spec_tokens=num_invalid_spec_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to record vLLM request acceptance stats: %s", exc)
+            return result
+
+        patched_make_spec_decoding_stats._speco_request_acceptance_stats = True
+        patched_make_spec_decoding_stats._speco_original_make_spec_decoding_stats = original_make_stats
+        Scheduler.make_spec_decoding_stats = patched_make_spec_decoding_stats
+
+    original_schedule = getattr(Scheduler, "schedule", None)
+    if callable(original_schedule) and not getattr(original_schedule, "_speco_request_acceptance_stats", False):
+
+        def patched_schedule(self, *args, **kwargs):
+            output = original_schedule(self, *args, **kwargs)
+            try:
+                _attach_vllm_request_stats_to_output(self, output)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to attach vLLM request acceptance stats: %s", exc)
+            return output
+
+        patched_schedule._speco_request_acceptance_stats = True
+        patched_schedule._speco_original_schedule = original_schedule
+        Scheduler.schedule = patched_schedule
+
+    return True
+
+
 def patch_vllm_dflash_config_aliases() -> bool:
     """Let vLLM 0.23 consume SPECO DFlash top-level target layer ids."""
 
@@ -1165,6 +1322,7 @@ def _speco_vllm_run_engine_core_with_acceptance_logging(*args, **kwargs):
     patch_vllm_dspark_registry_aliases()
     patch_vllm_dspark_runtime()
     patch_vllm_spec_decode_acceptance_logging()
+    patch_vllm_request_acceptance_stats()
     patch_vllm_worker_proc_entrypoint()
 
     from vllm.v1.engine.core import EngineCoreProc
@@ -1254,12 +1412,14 @@ def install_vllm_runtime_observability() -> bool:
     dspark_registry_patched = patch_vllm_dspark_registry_aliases()
     dspark_runtime_patched = patch_vllm_dspark_runtime()
     acceptance_patched = install_vllm_spec_decode_acceptance_logging()
+    request_acceptance_patched = patch_vllm_request_acceptance_stats()
     worker_proc_patched = patch_vllm_worker_proc_entrypoint()
     return (
         dflash_config_patched
         or dspark_registry_patched
         or dspark_runtime_patched
         or acceptance_patched
+        or request_acceptance_patched
         or worker_proc_patched
     )
 
@@ -1289,6 +1449,39 @@ def _vllm_spec_decode_stats_to_metrics(stats: dict[str, float]) -> dict[str, flo
     return {
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts": drafts,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": accepted_tokens,
+    }
+
+
+def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
+    summaries = getattr(output, "_speco_vllm_request_accept_stats", None)
+    if not isinstance(summaries, dict) or not summaries:
+        return {}
+    output_request_id = getattr(output, "request_id", None)
+    if output_request_id is not None and str(output_request_id) in summaries:
+        ordered_ids = [str(output_request_id)]
+    else:
+        ordered_ids = sorted(str(request_id) for request_id in summaries)
+    verify_rounds = []
+    draft_tokens = []
+    accepted_tokens = []
+    invalid_tokens = []
+    mean_accept_len = []
+    for request_id in ordered_ids:
+        item = summaries.get(request_id) or {}
+        rounds = _int_or_zero(item.get("verify_rounds", 0))
+        accepted = _int_or_zero(item.get("accepted_tokens", 0))
+        verify_rounds.append(rounds)
+        draft_tokens.append(_int_or_zero(item.get("draft_tokens", 0)))
+        accepted_tokens.append(accepted)
+        invalid_tokens.append(_int_or_zero(item.get("invalid_spec_tokens", 0)))
+        mean_accept_len.append(1.0 + accepted / rounds if rounds > 0 else None)
+    return {
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id": ordered_ids,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_verify_rounds": verify_rounds,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_draft_tokens": draft_tokens,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_accepted_tokens": accepted_tokens,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_invalid_spec_tokens": invalid_tokens,
+        "_verl_request_mean_accept_len": mean_accept_len,
     }
 
 
@@ -1349,6 +1542,9 @@ class _SpecoVLLMHttpServerMixin:
         stats = self._speco_pop_vllm_spec_decode_stats()
         extra_fields.update(_vllm_spec_decode_stats_to_metrics(stats))
 
+    def _speco_add_vllm_request_accept_extra_fields(self, output: Any, extra_fields: dict[str, Any]) -> None:
+        extra_fields.update(_vllm_request_accept_stats_to_extra_fields(output))
+
     async def launch_server(self, *args, **kwargs):
         self._speco_vllm_spec_decode_pending_stats = _new_vllm_spec_decode_stats()
         install_vllm_runtime_observability()
@@ -1391,6 +1587,7 @@ class _SpecoVLLMHttpServerMixin:
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
+            self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
         return output
 
 

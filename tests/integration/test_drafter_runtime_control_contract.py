@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 _speco_ray_trainer = pytest.importorskip(
@@ -10,6 +11,7 @@ _speco_ray_trainer = pytest.importorskip(
     reason="drafter runtime control contract needs the trainer dependency stack",
 )
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
+from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 
 
 class _FakeOldLogProbBatch:
@@ -172,6 +174,82 @@ def test_dspark_ce_only_oldlogprob_layout_keeps_aux_only_hidden() -> None:
     trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
 
     assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux"
+
+
+def test_dspark_oldlogprob_collect_plan_uses_request_hard_quota() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 1,
+            "training_interval_steps": 1,
+            "hidden_state_window_tokens_per_sample": 512,
+            "max_collect_samples_per_step_per_replica": 16,
+            "max_collect_tokens_per_step_per_replica": 16384,
+            "batch_size_per_gpu": 8,
+            "dspark_hard_candidate_ratio": 0.20,
+            "dspark_hard_sample_ratio": 0.375,
+            "hidden_state_window_mode": "random",
+        },
+        step=20,
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = "fsdp2"
+    trainer._speco_online_enabled = lambda: True
+    trainer._speco_owner_bucket_count = lambda: 5
+
+    batch_size = 100
+    prompt_width = 4
+    response_width = 520
+    prompts = torch.ones(batch_size, prompt_width, dtype=torch.long)
+    responses = torch.ones(batch_size, response_width, dtype=torch.long)
+    attention_mask = torch.ones(batch_size, prompt_width + response_width, dtype=torch.long)
+    response_mask = torch.ones(batch_size, response_width, dtype=torch.long)
+    batch = SimpleNamespace(
+        batch={
+            "prompts": prompts,
+            "responses": responses,
+            "attention_mask": attention_mask,
+            "response_mask": response_mask,
+        },
+        non_tensor_batch={
+            "_verl_request_mean_accept_len": [1.0 + index / 1000.0 for index in range(batch_size)],
+            "_speco_vllm_request_id": [f"req-{index}" for index in range(batch_size)],
+        },
+    )
+
+    plan = trainer._speco_build_oldlogprob_collect_plan(batch)
+
+    assert plan["selected_count"] == 80
+    assert int(plan["request_is_hard"].logical_and(plan["collect_mask"]).sum().item()) == 16
+    assert plan["request_is_hard"][:16].all()
+    assert not plan["request_is_hard"][16:].any()
+    assert [int((plan["request_is_hard"] & (plan["owner_rank"] == owner)).sum().item()) for owner in range(5)] == [
+        4,
+        3,
+        3,
+        3,
+        3,
+    ]
+
+
+def test_block_drafter_training_sampler_honors_explicit_hard_labels() -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.rank = 0
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={
+                    "dspark_hard_sample_ratio": 0.375,
+                }
+            )
+        )
+    )
+    items = [{"_verl_is_hard": True, "id": f"hard-{index}"} for index in range(16)]
+    items.extend({"_verl_is_hard": False, "id": f"normal-{index}"} for index in range(64))
+
+    selected = trainer._sample_training_items(items, 8, __import__("random").Random(1))
+
+    assert sum(1 for item in selected if item["_verl_is_hard"]) == 3
 
 
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:

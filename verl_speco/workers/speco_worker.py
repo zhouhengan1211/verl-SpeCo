@@ -568,6 +568,9 @@ class SpecoWorker(Worker):
             "hidden_last_hidden_select",
             "target_logprobs_position_start",
             "target_logprobs_position_end",
+            "_verl_request_mean_accept_len",
+            "_verl_is_hard",
+            "_verl_hard_score",
         ):
             if key in batch:
                 metadata[key] = batch[key]
@@ -691,6 +694,9 @@ class SpecoWorker(Worker):
                 "hidden_last_hidden_filter",
                 "hidden_last_hidden_select",
                 "hidden_states_layout",
+                "_verl_request_mean_accept_len",
+                "_verl_is_hard",
+                "_verl_hard_score",
                 "target_logprobs_position_start",
                 "target_logprobs_position_end",
                 "global_step",
