@@ -69,6 +69,7 @@ _SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY = "_speco_vllm_request_verify_rounds"
 _SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY = "_speco_vllm_request_accepted_tokens"
 _SPECO_VLLM_REQUEST_DRAFT_TOKENS_KEY = "_speco_vllm_request_draft_tokens"
 _SPECO_VLLM_REQUEST_INVALID_TOKENS_KEY = "_speco_vllm_request_invalid_spec_tokens"
+_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY = "_speco_vllm_request_completion_index"
 _SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY = "_verl_request_mean_accept_len"
 _SPECO_VLLM_REQUEST_IS_HARD_KEY = "_verl_is_hard"
 _SPECO_VLLM_REQUEST_HARD_SCORE_KEY = "_verl_hard_score"
@@ -85,6 +86,7 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {
     "_speco_vllm_request_accepted_tokens",
     "_speco_vllm_request_draft_tokens",
     "_speco_vllm_request_invalid_spec_tokens",
+    "_speco_vllm_request_completion_index",
     "_verl_request_mean_accept_len",
 }
 
@@ -1007,6 +1009,67 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         request_ids = _speco_sequence_values(non_tensor_batch.get(_SPECO_VLLM_REQUEST_ID_KEY), batch_size)
         return [str(value) if value is not None else str(index) for index, value in enumerate(request_ids)]
 
+    def _speco_request_completion_indices(self, batch: DataProto, batch_size: int) -> list[int | None]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+        values = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY),
+            batch_size,
+        )
+        indices = []
+        for value in values:
+            parsed = _speco_optional_float(value)
+            indices.append(int(parsed) if parsed is not None else None)
+        return indices
+
+    def _speco_log_request_accept_lens(
+        self,
+        *,
+        candidates: list[dict[str, Any]],
+        is_hard: torch.Tensor,
+        collect_mask: torch.Tensor,
+    ) -> tuple[list[dict[str, Any]], float]:
+        records = []
+        for candidate in candidates:
+            mean_accept_len = candidate.get("mean_accept_len")
+            if mean_accept_len is None:
+                continue
+            batch_idx = int(candidate["batch_idx"])
+            records.append(
+                {
+                    "completion_index": candidate.get("completion_index"),
+                    "batch_idx": batch_idx,
+                    "request_id": str(candidate.get("request_id")),
+                    "mean_accept_len": round(float(mean_accept_len), 6),
+                    "is_hard": bool(is_hard[batch_idx].item()),
+                    "collected": bool(collect_mask[batch_idx].item()),
+                }
+            )
+        records.sort(
+            key=lambda item: (
+                item["completion_index"] is None,
+                item["completion_index"] if item["completion_index"] is not None else item["batch_idx"],
+                item["batch_idx"],
+            )
+        )
+        accept_lens = [float(record["mean_accept_len"]) for record in records]
+        if accept_lens:
+            mean_accept_len = sum(accept_lens) / len(accept_lens)
+            accept_len_var = sum((value - mean_accept_len) ** 2 for value in accept_lens) / len(accept_lens)
+        else:
+            accept_len_var = 0.0
+        self._speco_last_request_accept_len_records = records
+        self._speco_last_request_accept_len_var = accept_len_var
+        if records:
+            logger.warning(
+                "[speco hard requests] step=%s request_accept_len_var=%.6f request_accept_lens_by_completion=%s",
+                self.global_steps,
+                accept_len_var,
+                json.dumps(records, ensure_ascii=True, separators=(",", ":")),
+            )
+        return records, accept_len_var
+
     def _speco_build_oldlogprob_collect_plan(self, batch: DataProto) -> dict[str, Any] | None:
         if not self._speco_oldlogprob_collection_enabled():
             return None
@@ -1060,6 +1123,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         response_lens: list[int] = []
         request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
         request_ids = self._speco_request_ids(batch, batch_size)
+        request_completion_indices = self._speco_request_completion_indices(batch, batch_size)
         candidate_count = 0
         selected_count = 0
         candidates: list[dict[str, Any]] = []
@@ -1085,6 +1149,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "sample_key": sample_key,
                     "request_id": request_ids[batch_idx],
                     "mean_accept_len": request_accept_lens[batch_idx],
+                    "completion_index": request_completion_indices[batch_idx],
                     "hash": self._speco_hash_fraction(f"{step_key}:{request_ids[batch_idx]}:{batch_idx}:hard"),
                 }
             )
@@ -1193,14 +1258,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             normal_candidates.sort(key=lambda candidate: self._speco_hash_fraction(f"{candidate['sample_key']}:normal"))
             add_round_robin(normal_candidates, start_owner=hard_added % owner_count)
 
-            valid_accept_lens = [float(candidate["mean_accept_len"]) for candidate in scored_candidates]
-            if valid_accept_lens:
-                mean_accept_len = sum(valid_accept_lens) / len(valid_accept_lens)
-                accept_len_var = sum(
-                    (value - mean_accept_len) ** 2 for value in valid_accept_lens
-                ) / len(valid_accept_lens)
-            else:
-                accept_len_var = 0.0
+            _, accept_len_var = self._speco_log_request_accept_lens(
+                candidates=scored_candidates,
+                is_hard=is_hard,
+                collect_mask=collect_mask,
+            )
             logger.info(
                 "[speco hard] step=%s requests=%s request_accept_len_var=%.3f hard_collected=%s/%s",
                 self.global_steps,
@@ -1208,6 +1270,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 accept_len_var,
                 int(is_hard.logical_and(collect_mask).sum().item()),
                 target_hard,
+            )
+        if not hard_enabled:
+            self._speco_log_request_accept_lens(
+                candidates=candidates,
+                is_hard=is_hard,
+                collect_mask=collect_mask,
             )
 
         self._speco_last_raw_drafter_samples = candidate_count
@@ -1231,6 +1299,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "request_mean_accept_len": mean_accept_len_tensor,
             "request_is_hard": is_hard,
             "request_hard_score": hard_score,
+            "request_completion_indices": request_completion_indices,
         }
 
     @staticmethod
@@ -1319,6 +1388,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         request_mean_accept_len = collect_plan.get("request_mean_accept_len")
         request_is_hard = collect_plan.get("request_is_hard")
         request_hard_score = collect_plan.get("request_hard_score")
+        request_completion_indices = collect_plan.get("request_completion_indices")
         buckets = [[] for _ in range(int(collect_plan["owner_count"]))]
         collected_rows = 0
         payload_bytes = 0
@@ -1421,6 +1491,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 sample[_SPECO_VLLM_REQUEST_IS_HARD_KEY] = bool(request_is_hard[batch_idx].item())
             if torch.is_tensor(request_hard_score) and batch_idx < int(request_hard_score.numel()):
                 sample[_SPECO_VLLM_REQUEST_HARD_SCORE_KEY] = float(request_hard_score[batch_idx].item())
+            if isinstance(request_completion_indices, (list, tuple)) and batch_idx < len(request_completion_indices):
+                completion_index = request_completion_indices[batch_idx]
+                if completion_index is not None:
+                    sample[_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY] = int(completion_index)
             if ref_chunks:
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:

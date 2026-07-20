@@ -1171,14 +1171,22 @@ def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
     if not request_ids:
         return
     summaries = {}
+    completion_order = []
+    completion_counter = _int_or_zero(getattr(scheduler, "_speco_vllm_request_completion_counter", 0))
     for request_id in request_ids:
         item = stats.pop(str(request_id), None)
         if item is not None:
+            item = dict(item)
+            item["completion_index"] = completion_counter
+            completion_counter += 1
+            completion_order.append(str(request_id))
             summaries[str(request_id)] = dict(item)
     if not summaries:
         return
+    scheduler._speco_vllm_request_completion_counter = completion_counter
     try:
         setattr(output, "_speco_vllm_request_accept_stats", summaries)
+        setattr(output, "_speco_vllm_request_completion_order", completion_order)
     except Exception:  # noqa: BLE001
         return
 
@@ -1360,6 +1368,7 @@ def _speco_vllm_worker_main_with_runtime_observability(*args, **kwargs):
     patch_vllm_dspark_registry_aliases()
     patch_vllm_dspark_runtime()
     patch_vllm_spec_decode_acceptance_logging()
+    patch_vllm_request_acceptance_stats()
 
     original = getattr(_speco_vllm_worker_main_with_runtime_observability, "_speco_original_worker_main", None)
     if not callable(original):
@@ -1456,15 +1465,20 @@ def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
     summaries = getattr(output, "_speco_vllm_request_accept_stats", None)
     if not isinstance(summaries, dict) or not summaries:
         return {}
+    completion_order = getattr(output, "_speco_vllm_request_completion_order", None)
     output_request_id = getattr(output, "request_id", None)
     if output_request_id is not None and str(output_request_id) in summaries:
         ordered_ids = [str(output_request_id)]
+    elif isinstance(completion_order, (list, tuple)):
+        ordered_ids = [str(request_id) for request_id in completion_order if str(request_id) in summaries]
+        ordered_ids.extend(str(request_id) for request_id in summaries if str(request_id) not in set(ordered_ids))
     else:
-        ordered_ids = sorted(str(request_id) for request_id in summaries)
+        ordered_ids = list(summaries)
     verify_rounds = []
     draft_tokens = []
     accepted_tokens = []
     invalid_tokens = []
+    completion_indices = []
     mean_accept_len = []
     for request_id in ordered_ids:
         item = summaries.get(request_id) or {}
@@ -1474,6 +1488,7 @@ def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
         draft_tokens.append(_int_or_zero(item.get("draft_tokens", 0)))
         accepted_tokens.append(accepted)
         invalid_tokens.append(_int_or_zero(item.get("invalid_spec_tokens", 0)))
+        completion_indices.append(_int_or_zero(item.get("completion_index", 0)))
         mean_accept_len.append(1.0 + accepted / rounds if rounds > 0 else None)
     return {
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id": ordered_ids,
@@ -1481,6 +1496,7 @@ def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_draft_tokens": draft_tokens,
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_accepted_tokens": accepted_tokens,
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_invalid_spec_tokens": invalid_tokens,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_completion_index": completion_indices,
         "_verl_request_mean_accept_len": mean_accept_len,
     }
 

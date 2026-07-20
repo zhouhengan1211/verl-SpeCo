@@ -2271,6 +2271,10 @@ class DrafterBaseTrainer:
                 ),
                 "_verl_is_hard": bool(_batch_item_int(batch.get("_verl_is_hard"), i) or 0),
                 "_verl_hard_score": _batch_item_float(batch.get("_verl_hard_score"), i),
+                "_speco_vllm_request_completion_index": _batch_item_int(
+                    batch.get("_speco_vllm_request_completion_index"),
+                    i,
+                ),
                 "_verl_input_seq_length": input_seq_length,
                 "hidden_lm_head_fingerprint": batch.get("hidden_lm_head_fingerprint"),
                 "hidden_last_hidden_logprob_check": batch.get("hidden_last_hidden_logprob_check"),

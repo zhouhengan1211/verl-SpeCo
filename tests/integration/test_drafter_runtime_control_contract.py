@@ -213,6 +213,7 @@ def test_dspark_oldlogprob_collect_plan_uses_request_hard_quota() -> None:
         non_tensor_batch={
             "_verl_request_mean_accept_len": [1.0 + index / 1000.0 for index in range(batch_size)],
             "_speco_vllm_request_id": [f"req-{index}" for index in range(batch_size)],
+            "_speco_vllm_request_completion_index": list(reversed(range(batch_size))),
         },
     )
 
@@ -229,6 +230,10 @@ def test_dspark_oldlogprob_collect_plan_uses_request_hard_quota() -> None:
         3,
         3,
     ]
+    records = trainer._speco_last_request_accept_len_records
+    assert records[0]["request_id"] == "req-99"
+    assert records[-1]["request_id"] == "req-0"
+    assert plan["request_completion_indices"][0] == 99
 
 
 def test_block_drafter_training_sampler_honors_explicit_hard_labels() -> None:

@@ -411,6 +411,7 @@ def test_vllm_request_acceptance_stats_keep_stable_transport_keys() -> None:
         "_speco_vllm_request_draft_tokens": [14],
         "_speco_vllm_request_accepted_tokens": [7],
         "_speco_vllm_request_invalid_spec_tokens": [1],
+        "_speco_vllm_request_completion_index": [0],
         "_verl_request_mean_accept_len": [4.5],
     }
 

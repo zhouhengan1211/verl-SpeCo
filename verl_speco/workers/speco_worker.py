@@ -571,6 +571,7 @@ class SpecoWorker(Worker):
             "_verl_request_mean_accept_len",
             "_verl_is_hard",
             "_verl_hard_score",
+            "_speco_vllm_request_completion_index",
         ):
             if key in batch:
                 metadata[key] = batch[key]
@@ -697,6 +698,7 @@ class SpecoWorker(Worker):
                 "_verl_request_mean_accept_len",
                 "_verl_is_hard",
                 "_verl_hard_score",
+                "_speco_vllm_request_completion_index",
                 "target_logprobs_position_start",
                 "target_logprobs_position_end",
                 "global_step",
