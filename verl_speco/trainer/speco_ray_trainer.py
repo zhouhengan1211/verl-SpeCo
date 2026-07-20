@@ -70,6 +70,7 @@ _SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY = "_speco_vllm_request_accepted_tokens"
 _SPECO_VLLM_REQUEST_DRAFT_TOKENS_KEY = "_speco_vllm_request_draft_tokens"
 _SPECO_VLLM_REQUEST_INVALID_TOKENS_KEY = "_speco_vllm_request_invalid_spec_tokens"
 _SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY = "_speco_vllm_request_completion_index"
+_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY = "_speco_vllm_request_elapsed_sec"
 _SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY = "_verl_request_mean_accept_len"
 _SPECO_VLLM_REQUEST_IS_HARD_KEY = "_verl_is_hard"
 _SPECO_VLLM_REQUEST_HARD_SCORE_KEY = "_verl_hard_score"
@@ -87,6 +88,7 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {
     "_speco_vllm_request_draft_tokens",
     "_speco_vllm_request_invalid_spec_tokens",
     "_speco_vllm_request_completion_index",
+    "_speco_vllm_request_elapsed_sec",
     "_verl_request_mean_accept_len",
 }
 
@@ -1023,6 +1025,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             indices.append(int(parsed) if parsed is not None else None)
         return indices
 
+    def _speco_request_elapsed_secs(self, batch: DataProto, batch_size: int) -> list[float | None]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+        values = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY),
+            batch_size,
+        )
+        return [_speco_optional_float(value) for value in values]
+
     def _speco_log_request_accept_lens(
         self,
         *,
@@ -1042,6 +1054,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "batch_idx": batch_idx,
                     "request_id": str(candidate.get("request_id")),
                     "mean_accept_len": round(float(mean_accept_len), 6),
+                    "elapsed_sec": (
+                        round(float(candidate["elapsed_sec"]), 6)
+                        if candidate.get("elapsed_sec") is not None
+                        else None
+                    ),
                     "is_hard": bool(is_hard[batch_idx].item()),
                     "collected": bool(collect_mask[batch_idx].item()),
                 }
@@ -1124,6 +1141,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
         request_ids = self._speco_request_ids(batch, batch_size)
         request_completion_indices = self._speco_request_completion_indices(batch, batch_size)
+        request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
         candidate_count = 0
         selected_count = 0
         candidates: list[dict[str, Any]] = []
@@ -1150,6 +1168,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "request_id": request_ids[batch_idx],
                     "mean_accept_len": request_accept_lens[batch_idx],
                     "completion_index": request_completion_indices[batch_idx],
+                    "elapsed_sec": request_elapsed_secs[batch_idx],
                     "hash": self._speco_hash_fraction(f"{step_key}:{request_ids[batch_idx]}:{batch_idx}:hard"),
                 }
             )
@@ -1303,6 +1322,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "request_is_hard": is_hard,
             "request_hard_score": hard_score,
             "request_completion_indices": request_completion_indices,
+            "request_elapsed_secs": request_elapsed_secs,
         }
 
     @staticmethod
@@ -1392,6 +1412,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         request_is_hard = collect_plan.get("request_is_hard")
         request_hard_score = collect_plan.get("request_hard_score")
         request_completion_indices = collect_plan.get("request_completion_indices")
+        request_elapsed_secs = collect_plan.get("request_elapsed_secs")
         buckets = [[] for _ in range(int(collect_plan["owner_count"]))]
         collected_rows = 0
         payload_bytes = 0
@@ -1498,6 +1519,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 completion_index = request_completion_indices[batch_idx]
                 if completion_index is not None:
                     sample[_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY] = int(completion_index)
+            if isinstance(request_elapsed_secs, (list, tuple)) and batch_idx < len(request_elapsed_secs):
+                elapsed_sec = request_elapsed_secs[batch_idx]
+                if elapsed_sec is not None:
+                    sample[_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY] = float(elapsed_sec)
             if ref_chunks:
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:

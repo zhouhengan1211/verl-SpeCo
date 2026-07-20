@@ -2269,6 +2269,10 @@ class DrafterBaseTrainer:
                     batch.get("_verl_request_mean_accept_len"),
                     i,
                 ),
+                "_speco_vllm_request_elapsed_sec": _batch_item_float(
+                    batch.get("_speco_vllm_request_elapsed_sec"),
+                    i,
+                ),
                 "_verl_is_hard": bool(_batch_item_int(batch.get("_verl_is_hard"), i) or 0),
                 "_verl_hard_score": _batch_item_float(batch.get("_verl_hard_score"), i),
                 "_speco_vllm_request_completion_index": _batch_item_int(
