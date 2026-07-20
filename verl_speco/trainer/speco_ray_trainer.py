@@ -1263,13 +1263,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 is_hard=is_hard,
                 collect_mask=collect_mask,
             )
-            logger.info(
-                "[speco hard] step=%s requests=%s request_accept_len_var=%.3f hard_collected=%s/%s",
-                self.global_steps,
-                len(scored_candidates),
-                accept_len_var,
-                int(is_hard.logical_and(collect_mask).sum().item()),
-                target_hard,
+            print(
+                "[speco hard] step=%s requests=%s request_accept_len_var=%.3f hard_collected=%s/%s"
+                % (
+                    self.global_steps,
+                    len(scored_candidates),
+                    accept_len_var,
+                    int(is_hard.logical_and(collect_mask).sum().item()),
+                    target_hard,
+                ),
+                flush=True,
             )
         if not hard_enabled:
             self._speco_log_request_accept_lens(
