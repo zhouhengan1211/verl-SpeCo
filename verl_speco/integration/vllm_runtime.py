@@ -25,6 +25,8 @@ SPECO_VLLM_WORKER_EXTENSION_CLS = "verl_speco.integration.vllm_runtime.SpecoVLLM
 SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
+SPECO_VLLM_REQUEST_STATS_PRINT_ENV = "VERL_SPECO_VLLM_REQUEST_STATS_PRINT"
+SPECO_VLLM_REQUEST_STATS_LOG_PATH_ENV = "VERL_SPECO_VLLM_REQUEST_STATS_LOG_PATH"
 SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX = "_speco_vllm_request"
 
 _VLLM_REPLICA_PATCHED = False
@@ -1182,9 +1184,12 @@ def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
         if item is not None:
             item = dict(item)
             item["completion_index"] = completion_counter
+            completed_sec = time.perf_counter()
+            item["completed_sec"] = completed_sec
+            item["completed_time"] = time.time()
             started_sec = item.get("started_sec")
             if isinstance(started_sec, (int, float)):
-                item["elapsed_sec"] = max(0.0, time.perf_counter() - float(started_sec))
+                item["elapsed_sec"] = max(0.0, completed_sec - float(started_sec))
             completion_counter += 1
             completion_order.append(str(request_id))
             summaries[str(request_id)] = dict(item)
@@ -1468,6 +1473,27 @@ def _vllm_spec_decode_stats_to_metrics(stats: dict[str, float]) -> dict[str, flo
     }
 
 
+def _append_vllm_request_stats_log(records: list[dict[str, Any]], output: Any) -> None:
+    if not records:
+        return
+    path = os.getenv(SPECO_VLLM_REQUEST_STATS_LOG_PATH_ENV, "/tmp/speco_vllm_request_stats.jsonl")
+    if not path:
+        return
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        payload = {
+            "output_request_id": str(getattr(output, "request_id", "")),
+            "count": len(records),
+            "records": records,
+        }
+        with open(path, "a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to append vLLM request acceptance stats log: %s", exc)
+
+
 def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
     summaries = getattr(output, "_speco_vllm_request_accept_stats", None)
     if not isinstance(summaries, dict) or not summaries:
@@ -1488,18 +1514,51 @@ def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
     completion_indices = []
     mean_accept_len = []
     elapsed_sec = []
+    records = []
     for request_id in ordered_ids:
         item = summaries.get(request_id) or {}
         rounds = _int_or_zero(item.get("verify_rounds", 0))
         accepted = _int_or_zero(item.get("accepted_tokens", 0))
+        request_mean_accept_len = 1.0 + accepted / rounds if rounds > 0 else None
+        elapsed_value = item.get("elapsed_sec")
+        request_elapsed_sec = float(elapsed_value) if isinstance(elapsed_value, (int, float)) else None
         verify_rounds.append(rounds)
         draft_tokens.append(_int_or_zero(item.get("draft_tokens", 0)))
         accepted_tokens.append(accepted)
         invalid_tokens.append(_int_or_zero(item.get("invalid_spec_tokens", 0)))
         completion_indices.append(_int_or_zero(item.get("completion_index", 0)))
-        mean_accept_len.append(1.0 + accepted / rounds if rounds > 0 else None)
-        elapsed_value = item.get("elapsed_sec")
-        elapsed_sec.append(float(elapsed_value) if isinstance(elapsed_value, (int, float)) else None)
+        mean_accept_len.append(request_mean_accept_len)
+        elapsed_sec.append(request_elapsed_sec)
+        records.append(
+            {
+                "request_id": str(request_id),
+                "completion_index": _int_or_zero(item.get("completion_index", 0)),
+                "completed_time": float(item["completed_time"])
+                if isinstance(item.get("completed_time"), (int, float))
+                else None,
+                "verify_rounds": rounds,
+                "draft_tokens": _int_or_zero(item.get("draft_tokens", 0)),
+                "accepted_tokens": accepted,
+                "mean_accept_len": round(float(request_mean_accept_len), 6)
+                if request_mean_accept_len is not None
+                else None,
+                "elapsed_sec": round(float(request_elapsed_sec), 6) if request_elapsed_sec is not None else None,
+            }
+        )
+    records.sort(
+        key=lambda record: (
+            record["completed_time"] is None,
+            record["completed_time"] if record["completed_time"] is not None else 0.0,
+            record["completion_index"],
+        )
+    )
+    _append_vllm_request_stats_log(records, output)
+    if _bool_or_none(os.getenv(SPECO_VLLM_REQUEST_STATS_PRINT_ENV, "1")):
+        print(
+            "[speco vllm request stats] count=%s records=%s"
+            % (len(records), json.dumps(records, ensure_ascii=True, separators=(",", ":"))),
+            flush=True,
+        )
     return {
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id": ordered_ids,
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_verify_rounds": verify_rounds,
