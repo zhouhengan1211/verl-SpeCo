@@ -40,6 +40,14 @@ class _FakeRolloutWorkerGroup:
         raise AssertionError("non-collect old-logprob steps should use the original compute path")
 
 
+class _ArrayLike:
+    def __init__(self, values):
+        self._values = values
+
+    def tolist(self):
+        return list(self._values)
+
+
 def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
     trainer.global_steps = step
@@ -234,6 +242,57 @@ def test_dspark_oldlogprob_collect_plan_uses_request_hard_quota() -> None:
     assert records[0]["request_id"] == "req-99"
     assert records[-1]["request_id"] == "req-0"
     assert plan["request_completion_indices"][0] == 99
+
+
+def test_oldlogprob_collect_plan_accepts_array_like_request_stats() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 1,
+            "training_interval_steps": 1,
+            "hidden_state_window_tokens_per_sample": 512,
+            "max_collect_samples_per_step_per_replica": 8,
+            "max_collect_tokens_per_step_per_replica": 8192,
+            "batch_size_per_gpu": 4,
+            "dspark_hard_candidate_ratio": 0.5,
+            "dspark_hard_sample_ratio": 0.5,
+            "hidden_state_window_mode": "front",
+        },
+        step=21,
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = "fsdp2"
+    trainer._speco_online_enabled = lambda: True
+    trainer._speco_owner_bucket_count = lambda: 2
+
+    batch_size = 12
+    prompt_width = 4
+    response_width = 520
+    batch = SimpleNamespace(
+        batch={
+            "prompts": torch.ones(batch_size, prompt_width, dtype=torch.long),
+            "responses": torch.ones(batch_size, response_width, dtype=torch.long),
+            "attention_mask": torch.ones(batch_size, prompt_width + response_width, dtype=torch.long),
+            "response_mask": torch.ones(batch_size, response_width, dtype=torch.long),
+        },
+        non_tensor_batch={
+            "_verl_request_mean_accept_len": _ArrayLike([1.0 + index for index in range(batch_size)]),
+            "_speco_vllm_request_id": _ArrayLike([f"req-{index}" for index in range(batch_size)]),
+            "_speco_vllm_request_completion_index": _ArrayLike(range(batch_size)),
+            "_speco_vllm_request_elapsed_sec": _ArrayLike([0.1 * index for index in range(batch_size)]),
+        },
+    )
+
+    plan = trainer._speco_build_oldlogprob_collect_plan(batch)
+
+    assert plan["selected_count"] == 12
+    assert int(plan["request_is_hard"].logical_and(plan["collect_mask"]).sum().item()) == 6
+    assert plan["request_is_hard"][:6].all()
+    assert not plan["request_is_hard"][6:].any()
+    records = trainer._speco_last_request_accept_len_records
+    assert len(records) == batch_size
+    assert records[0]["request_id"] == "req-0"
+    assert records[-1]["request_id"] == "req-11"
+    assert trainer._speco_last_request_accept_len_var > 0.0
 
 
 def test_block_drafter_training_sampler_honors_explicit_hard_labels() -> None:

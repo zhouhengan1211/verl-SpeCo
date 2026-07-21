@@ -230,6 +230,8 @@ def _speco_sequence_values(value: Any, size: int) -> list[Any]:
         return [None for _ in range(size)]
     if torch.is_tensor(value):
         value = value.detach().cpu().tolist()
+    elif hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
+        value = value.tolist()
     if not isinstance(value, (list, tuple)):
         value = [value]
     return [value[index] if index < len(value) else None for index in range(size)]
