@@ -1175,6 +1175,14 @@ def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
         return
     request_ids = _request_ids_from_scheduler_output(output)
     if not request_ids:
+        _log_vllm_request_stats_diag(
+            "missing_finished_request_ids",
+            {
+                "pending_stats_count": len(stats),
+                "pending_request_ids_head": list(stats.keys())[:8],
+            },
+            output,
+        )
         return
     summaries = {}
     completion_order = []
@@ -1194,6 +1202,16 @@ def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
             completion_order.append(str(request_id))
             summaries[str(request_id)] = dict(item)
     if not summaries:
+        _log_vllm_request_stats_diag(
+            "no_matching_request_stats_for_finished_ids",
+            {
+                "finished_request_ids_head": request_ids[:8],
+                "finished_request_count": len(request_ids),
+                "pending_stats_count": len(stats),
+                "pending_request_ids_head": list(stats.keys())[:8],
+            },
+            output,
+        )
         return
     scheduler._speco_vllm_request_completion_counter = completion_counter
     try:
@@ -1494,9 +1512,36 @@ def _append_vllm_request_stats_log(records: list[dict[str, Any]], output: Any) -
         logger.debug("Failed to append vLLM request acceptance stats log: %s", exc)
 
 
+def _log_vllm_request_stats_diag(event: str, payload: dict[str, Any], output: Any | None = None) -> None:
+    path = os.getenv(SPECO_VLLM_REQUEST_STATS_LOG_PATH_ENV, "/tmp/speco_vllm_request_stats.jsonl")
+    message = {
+        "event": event,
+        **payload,
+    }
+    if output is not None:
+        message["output_request_id"] = str(getattr(output, "request_id", ""))
+        message["output_type"] = type(output).__name__
+    if path:
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as file:
+                file.write(json.dumps(message, ensure_ascii=True, separators=(",", ":")) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to append vLLM request stats diagnostic log: %s", exc)
+    if _bool_or_none(os.getenv(SPECO_VLLM_REQUEST_STATS_PRINT_ENV, "1")):
+        print(
+            "[speco vllm request stats diag] %s"
+            % json.dumps(message, ensure_ascii=True, separators=(",", ":")),
+            flush=True,
+        )
+
+
 def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
     summaries = getattr(output, "_speco_vllm_request_accept_stats", None)
     if not isinstance(summaries, dict) or not summaries:
+        _log_vllm_request_stats_diag("missing_output_summaries", {}, output)
         return {}
     completion_order = getattr(output, "_speco_vllm_request_completion_order", None)
     output_request_id = getattr(output, "request_id", None)
@@ -1674,6 +1719,12 @@ class _SpecoVLLMHttpServerMixin:
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
             self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
+        else:
+            _log_vllm_request_stats_diag(
+                "missing_output_extra_fields",
+                {"extra_fields_type": type(extra_fields).__name__},
+                output,
+            )
         return output
 
 
