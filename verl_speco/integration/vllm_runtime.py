@@ -28,6 +28,7 @@ SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
 SPECO_VLLM_REQUEST_STATS_PRINT_ENV = "VERL_SPECO_VLLM_REQUEST_STATS_PRINT"
 SPECO_VLLM_REQUEST_STATS_LOG_PATH_ENV = "VERL_SPECO_VLLM_REQUEST_STATS_LOG_PATH"
 SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX = "_speco_vllm_request"
+SPECO_VLLM_REQUEST_STATS_TRACE_HEADER = "x-speco-vllm-request-accept-stats"
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
@@ -1172,38 +1173,101 @@ def _request_ids_from_scheduler_output(output: Any) -> list[str]:
     return list(dict.fromkeys(request_ids))
 
 
+def _pop_vllm_request_stats_for_ids(
+    scheduler: Any,
+    request_ids: Iterable[Any],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    stats = getattr(scheduler, "_speco_vllm_request_accept_stats", None)
+    if not isinstance(stats, dict) or not stats:
+        return {}, []
+    summaries: dict[str, dict[str, Any]] = {}
+    completion_order: list[str] = []
+    completion_counter = _int_or_zero(getattr(scheduler, "_speco_vllm_request_completion_counter", 0))
+    for request_id in request_ids:
+        request_id = str(request_id)
+        item = stats.pop(request_id, None)
+        if item is None:
+            continue
+        item = dict(item)
+        item["completion_index"] = completion_counter
+        completed_sec = time.perf_counter()
+        item["completed_sec"] = completed_sec
+        item["completed_time"] = time.time()
+        started_sec = item.get("started_sec")
+        if isinstance(started_sec, (int, float)):
+            item["elapsed_sec"] = max(0.0, completed_sec - float(started_sec))
+        completion_counter += 1
+        completion_order.append(request_id)
+        summaries[request_id] = dict(item)
+    if summaries:
+        scheduler._speco_vllm_request_completion_counter = completion_counter
+    return summaries, completion_order
+
+
+def _set_vllm_request_stats_on_output(
+    output: Any,
+    summaries: dict[str, dict[str, Any]],
+    completion_order: list[str],
+) -> bool:
+    if not summaries:
+        return False
+    try:
+        setattr(output, "_speco_vllm_request_accept_stats", summaries)
+        setattr(output, "_speco_vllm_request_completion_order", completion_order)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _encode_vllm_request_stats_trace_header(summary: dict[str, Any]) -> str:
+    return json.dumps(summary, ensure_ascii=True, separators=(",", ":"))
+
+
+def _decode_vllm_request_stats_trace_header(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        decoded = json.loads(value)
+    except Exception:  # noqa: BLE001
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _attach_vllm_request_stats_to_trace_headers(engine_core_output: Any, summary: dict[str, Any]) -> None:
+    if not summary:
+        return
+    trace_headers = getattr(engine_core_output, "trace_headers", None)
+    try:
+        headers = dict(trace_headers) if trace_headers is not None else {}
+        headers[SPECO_VLLM_REQUEST_STATS_TRACE_HEADER] = _encode_vllm_request_stats_trace_header(summary)
+        setattr(engine_core_output, "trace_headers", headers)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to attach SPECO request stats to EngineCoreOutput trace headers: %s", exc)
+
+
 def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
     stats = getattr(scheduler, "_speco_vllm_request_accept_stats", None)
     if not isinstance(stats, dict) or not stats:
         return
     request_ids = _request_ids_from_scheduler_output(output)
     if not request_ids:
-        _log_vllm_request_stats_diag(
-            "missing_finished_request_ids",
-            {
-                "pending_stats_count": len(stats),
-                "pending_request_ids_head": list(stats.keys())[:8],
-            },
-            output,
-        )
+        missing_count = _int_or_zero(
+            getattr(scheduler, "_speco_vllm_request_missing_finished_ids_diag_count", 0)
+        ) + 1
+        scheduler._speco_vllm_request_missing_finished_ids_diag_count = missing_count
+        if missing_count <= 3 or (missing_count & (missing_count - 1)) == 0:
+            _log_vllm_request_stats_diag(
+                "missing_finished_request_ids",
+                {
+                    "pending_stats_count": len(stats),
+                    "pending_request_ids_head": list(stats.keys())[:8],
+                    "diag_count": missing_count,
+                    "suppressed_repeated_count": max(0, missing_count - 3),
+                },
+                output,
+            )
         return
-    summaries = {}
-    completion_order = []
-    completion_counter = _int_or_zero(getattr(scheduler, "_speco_vllm_request_completion_counter", 0))
-    for request_id in request_ids:
-        item = stats.pop(str(request_id), None)
-        if item is not None:
-            item = dict(item)
-            item["completion_index"] = completion_counter
-            completed_sec = time.perf_counter()
-            item["completed_sec"] = completed_sec
-            item["completed_time"] = time.time()
-            started_sec = item.get("started_sec")
-            if isinstance(started_sec, (int, float)):
-                item["elapsed_sec"] = max(0.0, completed_sec - float(started_sec))
-            completion_counter += 1
-            completion_order.append(str(request_id))
-            summaries[str(request_id)] = dict(item)
+    summaries, completion_order = _pop_vllm_request_stats_for_ids(scheduler, request_ids)
     _log_vllm_request_stats_diag(
         "attach_attempt",
         {
@@ -1228,22 +1292,17 @@ def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
             output,
         )
         return
-    scheduler._speco_vllm_request_completion_counter = completion_counter
-    try:
-        setattr(output, "_speco_vllm_request_accept_stats", summaries)
-        setattr(output, "_speco_vllm_request_completion_order", completion_order)
-    except Exception:  # noqa: BLE001
-        return
+    _set_vllm_request_stats_on_output(output, summaries, completion_order)
 
 
 def patch_vllm_request_acceptance_stats() -> bool:
-    """Carry request-level speculative acceptance summaries on scheduler outputs.
+    """Carry request-level speculative acceptance summaries to rollout outputs.
 
-    The exact vLLM output classes differ across 0.23-era commits, so this patch
-    records stable integer counters in ``Scheduler.make_spec_decoding_stats`` and
-    best-effort attaches completed request summaries to the scheduler output.
-    Downstream SPECO collection treats the fields as optional and preserves the
-    old collect plan when they are absent.
+    vLLM V1 emits final request data through EngineCoreOutput -> RequestOutput,
+    while SchedulerOutput.finished_req_ids is only a cache-release signal in
+    newer commits. Record counters in the scheduler, transport them through an
+    internal trace header on final EngineCoreOutput objects, then restore them
+    on the RequestOutput consumed by verl.
     """
 
     try:
@@ -1287,6 +1346,57 @@ def patch_vllm_request_acceptance_stats() -> bool:
         patched_make_spec_decoding_stats._speco_original_make_spec_decoding_stats = original_make_stats
         Scheduler.make_spec_decoding_stats = patched_make_spec_decoding_stats
 
+    original_update_from_output = getattr(Scheduler, "update_from_output", None)
+    if callable(original_update_from_output) and not getattr(
+        original_update_from_output,
+        "_speco_request_acceptance_stats",
+        False,
+    ):
+
+        def patched_update_from_output(self, scheduler_output, model_runner_output):
+            engine_core_outputs = original_update_from_output(self, scheduler_output, model_runner_output)
+            try:
+                finished_outputs = []
+                for client_outputs in engine_core_outputs.values():
+                    for engine_core_output in getattr(client_outputs, "outputs", None) or ():
+                        is_finished = bool(getattr(engine_core_output, "finished", False))
+                        if not is_finished and getattr(engine_core_output, "finish_reason", None) is None:
+                            continue
+                        request_id = getattr(engine_core_output, "request_id", None)
+                        if request_id is not None:
+                            finished_outputs.append((str(request_id), engine_core_output))
+                if finished_outputs:
+                    summaries, _ = _pop_vllm_request_stats_for_ids(
+                        self,
+                        [request_id for request_id, _ in finished_outputs],
+                    )
+                    for request_id, engine_core_output in finished_outputs:
+                        summary = summaries.get(request_id)
+                        if summary is not None:
+                            _attach_vllm_request_stats_to_trace_headers(engine_core_output, summary)
+                    if summaries:
+                        _log_vllm_request_stats_diag(
+                            "attach_engine_core_outputs",
+                            {
+                                "finished_request_count": len(finished_outputs),
+                                "attached_summary_count": len(summaries),
+                                "finished_request_ids_head": [
+                                    request_id for request_id, _ in finished_outputs[:8]
+                                ],
+                                "record_call_count": _int_or_zero(
+                                    getattr(self, "_speco_vllm_request_accept_record_count", 0)
+                                ),
+                            },
+                            None,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to attach vLLM request stats to EngineCoreOutputs: %s", exc)
+            return engine_core_outputs
+
+        patched_update_from_output._speco_request_acceptance_stats = True
+        patched_update_from_output._speco_original_update_from_output = original_update_from_output
+        Scheduler.update_from_output = patched_update_from_output
+
     original_schedule = getattr(Scheduler, "schedule", None)
     if callable(original_schedule) and not getattr(original_schedule, "_speco_request_acceptance_stats", False):
 
@@ -1301,6 +1411,77 @@ def patch_vllm_request_acceptance_stats() -> bool:
         patched_schedule._speco_request_acceptance_stats = True
         patched_schedule._speco_original_schedule = original_schedule
         Scheduler.schedule = patched_schedule
+
+    try:
+        from vllm.v1.engine.output_processor import OutputProcessor, RequestState
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM output processor request stats patch: %s", exc)
+        return True
+
+    original_process_outputs = getattr(OutputProcessor, "process_outputs", None)
+    if callable(original_process_outputs) and not getattr(
+        original_process_outputs,
+        "_speco_request_acceptance_stats",
+        False,
+    ):
+
+        def patched_process_outputs(self, engine_core_outputs, *args, **kwargs):
+            try:
+                for engine_core_output in engine_core_outputs:
+                    request_id = getattr(engine_core_output, "request_id", None)
+                    req_state = getattr(self, "request_states", {}).get(request_id)
+                    if req_state is None:
+                        continue
+                    trace_headers = getattr(engine_core_output, "trace_headers", None)
+                    if not isinstance(trace_headers, dict):
+                        try:
+                            trace_headers = dict(trace_headers) if trace_headers is not None else {}
+                        except Exception:  # noqa: BLE001
+                            trace_headers = {}
+                    summary = _decode_vllm_request_stats_trace_header(
+                        trace_headers.get(SPECO_VLLM_REQUEST_STATS_TRACE_HEADER)
+                    )
+                    if summary:
+                        setattr(req_state, "_speco_vllm_request_accept_summary", summary)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to stage vLLM request stats on RequestState: %s", exc)
+            return original_process_outputs(self, engine_core_outputs, *args, **kwargs)
+
+        patched_process_outputs._speco_request_acceptance_stats = True
+        patched_process_outputs._speco_original_process_outputs = original_process_outputs
+        OutputProcessor.process_outputs = patched_process_outputs
+
+    original_make_request_output = getattr(RequestState, "make_request_output", None)
+    if callable(original_make_request_output) and not getattr(
+        original_make_request_output,
+        "_speco_request_acceptance_stats",
+        False,
+    ):
+
+        def patched_make_request_output(self, *args, **kwargs):
+            request_output = original_make_request_output(self, *args, **kwargs)
+            if request_output is None:
+                return request_output
+            summary = getattr(self, "_speco_vllm_request_accept_summary", None)
+            if not isinstance(summary, dict) or not summary:
+                return request_output
+            request_id = getattr(request_output, "request_id", None) or getattr(
+                self,
+                "external_req_id",
+                None,
+            )
+            if request_id is not None:
+                request_id = str(request_id)
+                _set_vllm_request_stats_on_output(request_output, {request_id: summary}, [request_id])
+                try:
+                    delattr(self, "_speco_vllm_request_accept_summary")
+                except Exception:  # noqa: BLE001
+                    pass
+            return request_output
+
+        patched_make_request_output._speco_request_acceptance_stats = True
+        patched_make_request_output._speco_original_make_request_output = original_make_request_output
+        RequestState.make_request_output = patched_make_request_output
 
     return True
 
