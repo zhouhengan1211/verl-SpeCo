@@ -14,6 +14,7 @@ import os
 import sys
 import time
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 logger = logging.getLogger(__file__)
@@ -29,6 +30,7 @@ SPECO_VLLM_REQUEST_STATS_PRINT_ENV = "VERL_SPECO_VLLM_REQUEST_STATS_PRINT"
 SPECO_VLLM_REQUEST_STATS_LOG_PATH_ENV = "VERL_SPECO_VLLM_REQUEST_STATS_LOG_PATH"
 SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX = "_speco_vllm_request"
 SPECO_VLLM_REQUEST_STATS_TRACE_HEADER = "x-speco-vllm-request-accept-stats"
+_SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID: dict[str, tuple[dict[str, dict[str, Any]], list[str]]] = {}
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
@@ -1219,6 +1221,32 @@ def _set_vllm_request_stats_on_output(
     return True
 
 
+def _stage_vllm_request_stats_for_rollout_output(
+    request_id: Any,
+    summaries: dict[str, dict[str, Any]],
+    completion_order: list[str],
+) -> None:
+    if request_id is None or not summaries:
+        return
+    _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID[str(request_id)] = (summaries, completion_order)
+
+
+def _pop_vllm_request_stats_for_rollout_output(
+    request_id: Any,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    if request_id is None:
+        return {}, []
+    return _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID.pop(str(request_id), ({}, []))
+
+
+def _vllm_generate_request_id(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if "request_id" in kwargs:
+        return kwargs["request_id"]
+    if len(args) >= 3:
+        return args[2]
+    return None
+
+
 def _encode_vllm_request_stats_trace_header(summary: dict[str, Any]) -> str:
     return json.dumps(summary, ensure_ascii=True, separators=(",", ":"))
 
@@ -1472,7 +1500,10 @@ def patch_vllm_request_acceptance_stats() -> bool:
             )
             if request_id is not None:
                 request_id = str(request_id)
-                _set_vllm_request_stats_on_output(request_output, {request_id: summary}, [request_id])
+                summaries = {request_id: summary}
+                completion_order = [request_id]
+                _set_vllm_request_stats_on_output(request_output, summaries, completion_order)
+                _stage_vllm_request_stats_for_rollout_output(request_id, summaries, completion_order)
                 try:
                     delattr(self, "_speco_vllm_request_accept_summary")
                 except Exception:  # noqa: BLE001
@@ -1919,11 +1950,20 @@ class _SpecoVLLMHttpServerMixin:
             AsyncLLM.from_vllm_config = original_from_vllm_config_attr
 
     async def generate(self, *args, **kwargs):
+        request_id = _vllm_generate_request_id(args, kwargs)
         output = await super().generate(*args, **kwargs)
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
             self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
+            summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(request_id)
+            if summaries:
+                proxy_output = SimpleNamespace(
+                    request_id=request_id,
+                    _speco_vllm_request_accept_stats=summaries,
+                    _speco_vllm_request_completion_order=completion_order,
+                )
+                extra_fields.update(_vllm_request_accept_stats_to_extra_fields(proxy_output))
         else:
             _log_vllm_request_stats_diag(
                 "missing_output_extra_fields",

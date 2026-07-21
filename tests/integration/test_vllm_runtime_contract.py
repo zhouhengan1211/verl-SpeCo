@@ -18,9 +18,12 @@ from verl_speco.integration.vllm_runtime import (
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _pop_vllm_request_stats_for_ids,
+    _pop_vllm_request_stats_for_rollout_output,
     _record_vllm_request_acceptance_stats,
     _record_vllm_spec_decode_scheduler_stats,
     _set_vllm_request_stats_on_output,
+    _stage_vllm_request_stats_for_rollout_output,
+    _vllm_generate_request_id,
     _vllm_request_accept_stats_to_extra_fields,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
@@ -470,6 +473,28 @@ def test_vllm_request_acceptance_stats_extra_fields_use_request_output_id() -> N
         "_speco_vllm_request_elapsed_sec": [0.5],
         "_verl_request_mean_accept_len": [5.0],
     }
+
+
+def test_vllm_request_acceptance_stats_can_stage_for_token_output() -> None:
+    summary = {
+        "verify_rounds": 4,
+        "draft_tokens": 28,
+        "accepted_tokens": 12,
+        "invalid_spec_tokens": 0,
+        "completion_index": 5,
+    }
+    _stage_vllm_request_stats_for_rollout_output("server-req-1", {"server-req-1": summary}, ["server-req-1"])
+
+    summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
+        _vllm_generate_request_id(([], {}, "server-req-1"), {})
+    )
+    output = SimpleNamespace(
+        request_id="server-req-1",
+        _speco_vllm_request_accept_stats=summaries,
+        _speco_vllm_request_completion_order=completion_order,
+    )
+
+    assert _vllm_request_accept_stats_to_extra_fields(output)["_verl_request_mean_accept_len"] == [4.0]
 
 
 def test_trainer_keeps_public_acceptance_metric_name() -> None:
