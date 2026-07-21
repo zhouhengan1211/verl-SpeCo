@@ -25,6 +25,7 @@ from verl_speco.integration.vllm_runtime import (
     _stage_vllm_request_stats_for_rollout_output,
     _vllm_generate_request_id,
     _vllm_request_accept_stats_to_extra_fields,
+    _vllm_request_accept_stats_to_scalar_extra_fields,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
@@ -494,7 +495,11 @@ def test_vllm_request_acceptance_stats_can_stage_for_token_output() -> None:
         _speco_vllm_request_completion_order=completion_order,
     )
 
-    assert _vllm_request_accept_stats_to_extra_fields(output)["_verl_request_mean_accept_len"] == [4.0]
+    scalar_fields = _vllm_request_accept_stats_to_scalar_extra_fields(output)
+
+    assert scalar_fields["_verl_request_mean_accept_len"] == 4.0
+    assert scalar_fields["_speco_vllm_request_id"] == "server-req-1"
+    assert scalar_fields["_speco_vllm_request_verify_rounds"] == 4
 
 
 def test_trainer_keeps_public_acceptance_metric_name() -> None:

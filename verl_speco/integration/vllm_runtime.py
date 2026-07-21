@@ -1852,6 +1852,17 @@ def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
     }
 
 
+def _vllm_request_accept_stats_to_scalar_extra_fields(output: Any) -> dict[str, Any]:
+    fields = _vllm_request_accept_stats_to_extra_fields(output)
+    scalar_fields = {}
+    for key, value in fields.items():
+        if isinstance(value, (list, tuple)):
+            scalar_fields[key] = value[0] if value else None
+        else:
+            scalar_fields[key] = value
+    return scalar_fields
+
+
 def _build_speco_vllm_stat_logger(server: Any):
     from vllm.v1.metrics.loggers import StatLoggerBase
 
@@ -1963,7 +1974,7 @@ class _SpecoVLLMHttpServerMixin:
                     _speco_vllm_request_accept_stats=summaries,
                     _speco_vllm_request_completion_order=completion_order,
                 )
-                extra_fields.update(_vllm_request_accept_stats_to_extra_fields(proxy_output))
+                extra_fields.update(_vllm_request_accept_stats_to_scalar_extra_fields(proxy_output))
         else:
             _log_vllm_request_stats_diag(
                 "missing_output_extra_fields",
