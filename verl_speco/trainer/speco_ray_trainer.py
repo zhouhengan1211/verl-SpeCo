@@ -1078,13 +1078,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             accept_len_var = 0.0
         self._speco_last_request_accept_len_records = records
         self._speco_last_request_accept_len_var = accept_len_var
-        if records:
-            logger.warning(
-                "[speco hard requests] step=%s request_accept_len_var=%.6f request_accept_lens_by_completion=%s",
-                self.global_steps,
-                accept_len_var,
-                json.dumps(records, ensure_ascii=True, separators=(",", ":")),
-            )
         return records, accept_len_var
 
     def _speco_build_oldlogprob_collect_plan(self, batch: DataProto) -> dict[str, Any] | None:
