@@ -1140,6 +1140,9 @@ def _record_vllm_request_acceptance_stats(
     item["accepted_tokens"] += accepted_tokens
     item["invalid_spec_tokens"] += invalid_tokens
     item["last_update_sec"] = now
+    scheduler._speco_vllm_request_accept_record_count = _int_or_zero(
+        getattr(scheduler, "_speco_vllm_request_accept_record_count", 0)
+    ) + 1
 
 
 def _request_ids_from_scheduler_output(output: Any) -> list[str]:
@@ -1201,6 +1204,18 @@ def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
             completion_counter += 1
             completion_order.append(str(request_id))
             summaries[str(request_id)] = dict(item)
+    _log_vllm_request_stats_diag(
+        "attach_attempt",
+        {
+            "finished_request_count": len(request_ids),
+            "finished_request_ids_head": request_ids[:8],
+            "attached_summary_count": len(summaries),
+            "pending_stats_count_after_pop": len(stats),
+            "pending_request_ids_head_after_pop": list(stats.keys())[:8],
+            "record_call_count": _int_or_zero(getattr(scheduler, "_speco_vllm_request_accept_record_count", 0)),
+        },
+        output,
+    )
     if not summaries:
         _log_vllm_request_stats_diag(
             "no_matching_request_stats_for_finished_ids",
@@ -1541,7 +1556,16 @@ def _log_vllm_request_stats_diag(event: str, payload: dict[str, Any], output: An
 def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
     summaries = getattr(output, "_speco_vllm_request_accept_stats", None)
     if not isinstance(summaries, dict) or not summaries:
-        _log_vllm_request_stats_diag("missing_output_summaries", {}, output)
+        completion_order = getattr(output, "_speco_vllm_request_completion_order", None)
+        if completion_order is not None or hasattr(output, "_speco_vllm_request_accept_stats"):
+            _log_vllm_request_stats_diag(
+                "missing_output_summaries",
+                {
+                    "completion_order_type": type(completion_order).__name__,
+                    "completion_order_len": len(completion_order) if isinstance(completion_order, (list, tuple)) else 0,
+                },
+                output,
+            )
         return {}
     completion_order = getattr(output, "_speco_vllm_request_completion_order", None)
     output_request_id = getattr(output, "request_id", None)
