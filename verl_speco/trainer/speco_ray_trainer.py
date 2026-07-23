@@ -1093,11 +1093,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         batch_size = self._speco_batch_size_from_request_stats(batch)
         should_print = self._speco_should_log_request_accept_len_variance()
         if batch_size <= 0:
-            print(
-                "[speco request accept len diag] step=%s source=%s request_stats_batch_size=0 should_print=%s"
-                % (self.global_steps, source, int(should_print)),
-                flush=True,
-            )
             return False
 
         request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
@@ -1119,19 +1114,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             candidates=candidates,
             is_hard=marker,
             collect_mask=marker,
-        )
-        print(
-            "[speco request accept len diag] step=%s source=%s request_stats_batch_size=%s "
-            "variance_records=%s variance=%.6f should_print=%s"
-            % (
-                self.global_steps,
-                source,
-                batch_size,
-                len(records),
-                accept_len_var,
-                int(should_print),
-            ),
-            flush=True,
         )
         if should_print and records:
             print(
@@ -1297,21 +1279,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 stat_key_non_null_counts[key] = sum(value is not None for value in values)
         else:
             stat_key_non_null_counts = {key: 0 for key in stat_keys}
-        print(
-            "[speco request accept len diag] step=%s collect_plan=1 batch_size=%s "
-            "mean_accept_len_key=%s mean_accept_len_non_null=%s verify_rounds_non_null=%s "
-            "accepted_tokens_non_null=%s variance_interval_matched=%s"
-            % (
-                self.global_steps,
-                batch_size,
-                int(stat_key_presence[_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY]),
-                stat_key_non_null_counts[_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY],
-                stat_key_non_null_counts[_SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY],
-                stat_key_non_null_counts[_SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY],
-                int(self._speco_should_log_request_accept_len_variance()),
-            ),
-            flush=True,
-        )
         candidate_count = 0
         selected_count = 0
         prompt_empty_count = 0
@@ -1573,24 +1540,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 }
             )
 
-        request_accept_len_records, accept_len_var = self._speco_log_request_accept_lens(
+        self._speco_log_request_accept_lens(
             candidates=all_request_accept_len_candidates,
             is_hard=is_hard,
             collect_mask=collect_mask,
-        )
-        print(
-            "[speco request accept len diag] step=%s collect_plan_variance_records=%s variance=%.6f "
-            "collect_plan_print_suppressed=%s "
-            "selected_count=%s hard_enabled=%s"
-            % (
-                self.global_steps,
-                len(request_accept_len_records),
-                accept_len_var,
-                1,
-                selected_count,
-                int(hard_enabled),
-            ),
-            flush=True,
         )
 
         self._speco_last_raw_drafter_samples = candidate_count
@@ -2397,30 +2350,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             collect_interval_matched = self._speco_should_collect_drafter_this_step()
             train_interval_matched = self._speco_should_train_drafter_this_step()
             self._speco_last_collect_interval_matched = int(collect_interval_matched)
-            training_cfg = self._speco_drafter_training_config()
-            variance_interval_steps = training_cfg.get("request_accept_len_variance_interval_steps", 1)
-            print(
-                "[speco request accept len diag] step=%s oldlogprob_wrapper=1 collect_interval_matched=%s "
-                "train_interval_matched=%s variance_interval_steps=%s variance_interval_matched=%s"
-                % (
-                    self.global_steps,
-                    int(collect_interval_matched),
-                    int(train_interval_matched),
-                    variance_interval_steps,
-                    int(self._speco_should_log_request_accept_len_variance()),
-                ),
-                flush=True,
-            )
             prepare_started = time.perf_counter()
             original_batch = batch
-            self._speco_log_request_accept_len_variance_from_batch(original_batch, source="oldlogprob_batch")
 
-            def compute_old_log_prob_without_collection(reason: str):
-                print(
-                    "[speco request accept len diag] step=%s oldlogprob_collect_plan=0 reason=%s"
-                    % (self.global_steps, reason),
-                    flush=True,
-                )
+            def compute_old_log_prob_without_collection():
                 self._speco_last_oldlogprob_prepare_elapsed_sec = time.perf_counter() - prepare_started
                 compute_started = time.perf_counter()
                 if self._speco_oldlogprob_entropy_hook_enabled():
@@ -2434,12 +2367,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 return old_log_prob, old_log_prob_mfu
 
             if not collect_interval_matched or not train_interval_matched:
-                return compute_old_log_prob_without_collection("interval_not_matched")
+                return compute_old_log_prob_without_collection()
 
             batch = _select_policy_model_batch(batch)
             collect_plan = self._speco_build_oldlogprob_collect_plan(batch)
             if collect_plan is None:
-                return compute_old_log_prob_without_collection("collect_plan_none")
+                return compute_old_log_prob_without_collection()
             batch_td = batch.to_tensordict()
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self._speco_oldlogprob_calculate_entropy()
