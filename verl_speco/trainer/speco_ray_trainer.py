@@ -1064,6 +1064,83 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         return [_speco_optional_float(value) for value in values]
 
+    @staticmethod
+    def _speco_batch_size_from_request_stats(batch: DataProto) -> int:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return 0
+        for key in (
+            _SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY,
+            _SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY,
+            _SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY,
+            _SPECO_VLLM_REQUEST_ID_KEY,
+        ):
+            values = non_tensor_batch.get(key)
+            if values is None or isinstance(values, (str, bytes)):
+                continue
+            try:
+                return len(values)
+            except TypeError:
+                tolist = getattr(values, "tolist", None)
+                if callable(tolist):
+                    try:
+                        return len(tolist())
+                    except TypeError:
+                        continue
+        return 0
+
+    def _speco_log_request_accept_len_variance_from_batch(self, batch: DataProto, *, source: str) -> bool:
+        batch_size = self._speco_batch_size_from_request_stats(batch)
+        should_print = self._speco_should_log_request_accept_len_variance()
+        if batch_size <= 0:
+            print(
+                "[speco request accept len diag] step=%s source=%s request_stats_batch_size=0 should_print=%s"
+                % (self.global_steps, source, int(should_print)),
+                flush=True,
+            )
+            return False
+
+        request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
+        request_ids = self._speco_request_ids(batch, batch_size)
+        request_completion_indices = self._speco_request_completion_indices(batch, batch_size)
+        request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
+        candidates = [
+            {
+                "batch_idx": batch_idx,
+                "request_id": request_ids[batch_idx],
+                "mean_accept_len": request_accept_lens[batch_idx],
+                "completion_index": request_completion_indices[batch_idx],
+                "elapsed_sec": request_elapsed_secs[batch_idx],
+            }
+            for batch_idx in range(batch_size)
+        ]
+        marker = torch.zeros(batch_size, dtype=torch.bool)
+        records, accept_len_var = self._speco_log_request_accept_lens(
+            candidates=candidates,
+            is_hard=marker,
+            collect_mask=marker,
+        )
+        print(
+            "[speco request accept len diag] step=%s source=%s request_stats_batch_size=%s "
+            "variance_records=%s variance=%.6f should_print=%s"
+            % (
+                self.global_steps,
+                source,
+                batch_size,
+                len(records),
+                accept_len_var,
+                int(should_print),
+            ),
+            flush=True,
+        )
+        if should_print and records:
+            print(
+                "[speco request accept len] step=%s requests=%s request_accept_len_var=%.3f source=%s"
+                % (self.global_steps, len(records), accept_len_var, source),
+                flush=True,
+            )
+        return bool(records)
+
     def _speco_log_request_accept_lens(
         self,
         *,
@@ -1501,33 +1578,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             is_hard=is_hard,
             collect_mask=collect_mask,
         )
-        should_log_request_accept_len_variance = self._speco_should_log_request_accept_len_variance()
         print(
-            "[speco request accept len diag] step=%s variance_records=%s variance=%.6f should_print=%s "
+            "[speco request accept len diag] step=%s collect_plan_variance_records=%s variance=%.6f "
+            "collect_plan_print_suppressed=%s "
             "selected_count=%s hard_enabled=%s"
             % (
                 self.global_steps,
                 len(request_accept_len_records),
                 accept_len_var,
-                int(should_log_request_accept_len_variance),
+                1,
                 selected_count,
                 int(hard_enabled),
             ),
             flush=True,
         )
-        if should_log_request_accept_len_variance:
-            print(
-                "[speco request accept len] step=%s requests=%s request_accept_len_var=%.3f "
-                "hard_enabled=%s hard_collected=%s"
-                % (
-                    self.global_steps,
-                    len(request_accept_len_records),
-                    accept_len_var,
-                    int(hard_enabled),
-                    int(is_hard.logical_and(collect_mask).sum().item()),
-                ),
-                flush=True,
-            )
 
         self._speco_last_raw_drafter_samples = candidate_count
         self._speco_last_oldlogprob_candidate_samples = candidate_count
@@ -2300,6 +2364,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             is_validation_generation = _speco_is_validation_generation(args, kwargs, gen_batch_output)
             if not is_validation_generation:
                 self._speco_store_rollout_metrics(gen_batch_output)
+                self._speco_log_request_accept_len_variance_from_batch(gen_batch_output, source="rollout")
                 collected = self._speco_collect_generation_samples(gen_batch_output)
                 if collected:
                     meta_info = getattr(gen_batch_output, "meta_info", None)
@@ -2348,6 +2413,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
             prepare_started = time.perf_counter()
             original_batch = batch
+            self._speco_log_request_accept_len_variance_from_batch(original_batch, source="oldlogprob_batch")
 
             def compute_old_log_prob_without_collection(reason: str):
                 print(

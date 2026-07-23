@@ -298,42 +298,27 @@ def test_oldlogprob_collect_plan_accepts_array_like_request_stats() -> None:
 def test_request_accept_len_variance_logs_without_hard_sampling(capsys) -> None:
     trainer = _trainer(
         {
-            "collect_hidden_states_from_old_logprob": True,
-            "collect_interval_steps": 1,
-            "training_interval_steps": 1,
             "request_accept_len_variance_interval_steps": 2,
-            "hidden_state_window_tokens_per_sample": 8,
-            "max_collect_samples_per_step_per_replica": 4,
-            "batch_size_per_gpu": 4,
             "dspark_hard_candidate_ratio": 0.0,
             "dspark_hard_sample_ratio": 0.0,
         },
         step=4,
     )
-    trainer.config.actor_rollout_ref.actor.strategy = "fsdp2"
-    trainer._speco_online_enabled = lambda: True
 
     batch_size = 4
-    prompt_width = 2
-    response_width = 10
     batch = SimpleNamespace(
-        batch={
-            "prompts": torch.ones(batch_size, prompt_width, dtype=torch.long),
-            "responses": torch.ones(batch_size, response_width, dtype=torch.long),
-            "attention_mask": torch.ones(batch_size, prompt_width + response_width, dtype=torch.long),
-            "response_mask": torch.ones(batch_size, response_width, dtype=torch.long),
-        },
+        batch={},
         non_tensor_batch={
             "_verl_request_mean_accept_len": [1.0, 2.0, 3.0, 4.0],
             "_speco_vllm_request_id": [f"req-{index}" for index in range(batch_size)],
         },
     )
 
-    plan = trainer._speco_build_oldlogprob_collect_plan(batch)
+    logged = trainer._speco_log_request_accept_len_variance_from_batch(batch, source="test")
 
     captured = capsys.readouterr()
-    assert plan["selected_count"] == batch_size
-    assert "hard_enabled=0" in captured.out
+    assert logged is True
+    assert "source=test" in captured.out
     assert "request_accept_len_var=1.250" in captured.out
     assert trainer._speco_last_request_accept_len_var == 1.25
 
@@ -341,37 +326,23 @@ def test_request_accept_len_variance_logs_without_hard_sampling(capsys) -> None:
 def test_request_accept_len_variance_respects_log_interval(capsys) -> None:
     trainer = _trainer(
         {
-            "collect_hidden_states_from_old_logprob": True,
-            "collect_interval_steps": 1,
-            "training_interval_steps": 1,
             "request_accept_len_variance_interval_steps": 3,
-            "hidden_state_window_tokens_per_sample": 8,
-            "max_collect_samples_per_step_per_replica": 2,
-            "batch_size_per_gpu": 2,
         },
         step=4,
     )
-    trainer.config.actor_rollout_ref.actor.strategy = "fsdp2"
-    trainer._speco_online_enabled = lambda: True
 
     batch_size = 2
-    prompt_width = 2
-    response_width = 10
     batch = SimpleNamespace(
-        batch={
-            "prompts": torch.ones(batch_size, prompt_width, dtype=torch.long),
-            "responses": torch.ones(batch_size, response_width, dtype=torch.long),
-            "attention_mask": torch.ones(batch_size, prompt_width + response_width, dtype=torch.long),
-            "response_mask": torch.ones(batch_size, response_width, dtype=torch.long),
-        },
+        batch={},
         non_tensor_batch={
             "_verl_request_mean_accept_len": [1.0, 3.0],
             "_speco_vllm_request_id": ["req-0", "req-1"],
         },
     )
 
-    trainer._speco_build_oldlogprob_collect_plan(batch)
+    logged = trainer._speco_log_request_accept_len_variance_from_batch(batch, source="test")
 
+    assert logged is True
     assert "[speco request accept len]" not in capsys.readouterr().out
     assert trainer._speco_last_request_accept_len_var == 1.0
 
