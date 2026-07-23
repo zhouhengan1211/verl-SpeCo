@@ -753,6 +753,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_cfg = self._speco_drafter_training_config()
         return speco_step_matches_interval(self.global_steps, training_cfg.get("training_interval_steps", 1))
 
+    def _speco_should_log_request_accept_len_variance(self) -> bool:
+        training_cfg = self._speco_drafter_training_config()
+        interval_steps = training_cfg.get("request_accept_len_variance_interval_steps", 1)
+        return speco_step_matches_interval(self.global_steps, interval_steps)
+
     def _speco_drafter_training_mode(self) -> str:
         training_cfg = self._speco_drafter_training_config()
         return str(training_cfg.get("mode", "online") or "online").strip().lower()
@@ -1186,6 +1191,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         request_ids = self._speco_request_ids(batch, batch_size)
         request_completion_indices = self._speco_request_completion_indices(batch, batch_size)
         request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
+        all_request_accept_len_candidates = [
+            {
+                "batch_idx": batch_idx,
+                "request_id": request_ids[batch_idx],
+                "mean_accept_len": request_accept_lens[batch_idx],
+                "completion_index": request_completion_indices[batch_idx],
+                "elapsed_sec": request_elapsed_secs[batch_idx],
+            }
+            for batch_idx in range(batch_size)
+        ]
         non_tensor_batch = getattr(batch, "non_tensor_batch", None)
         stat_keys = (
             _SPECO_VLLM_REQUEST_ID_KEY,
@@ -1466,27 +1481,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 }
             )
 
-            _, accept_len_var = self._speco_log_request_accept_lens(
-                candidates=scored_candidates,
-                is_hard=is_hard,
-                collect_mask=collect_mask,
-            )
+        request_accept_len_records, accept_len_var = self._speco_log_request_accept_lens(
+            candidates=all_request_accept_len_candidates,
+            is_hard=is_hard,
+            collect_mask=collect_mask,
+        )
+        if self._speco_should_log_request_accept_len_variance():
             print(
-                "[speco hard] step=%s requests=%s request_accept_len_var=%.3f hard_collected=%s/%s"
+                "[speco request accept len] step=%s requests=%s request_accept_len_var=%.3f "
+                "hard_enabled=%s hard_collected=%s"
                 % (
                     self.global_steps,
-                    len(scored_candidates),
+                    len(request_accept_len_records),
                     accept_len_var,
+                    int(hard_enabled),
                     int(is_hard.logical_and(collect_mask).sum().item()),
-                    target_hard,
                 ),
                 flush=True,
-            )
-        if not hard_enabled:
-            self._speco_log_request_accept_lens(
-                candidates=candidates,
-                is_hard=is_hard,
-                collect_mask=collect_mask,
             )
 
         self._speco_last_raw_drafter_samples = candidate_count
