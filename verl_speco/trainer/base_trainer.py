@@ -2583,7 +2583,11 @@ class DrafterBaseTrainer:
                     hard_count,
                 )
             selected_ids = {id(item) for item in selected}
-            remaining = [item for item in available_data if id(item) not in selected_ids]
+            remaining = [
+                item
+                for item in available_data
+                if id(item) not in selected_ids and self._explicit_hard_label(item) is not True
+            ]
             random_count = batch_size - len(selected)
             if random_count > 0:
                 selected.extend(rng.sample(remaining, min(random_count, len(remaining))))

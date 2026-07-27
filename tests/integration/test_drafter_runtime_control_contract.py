@@ -368,6 +368,28 @@ def test_block_drafter_training_sampler_honors_explicit_hard_labels() -> None:
     assert sum(1 for item in selected if item["_verl_is_hard"]) == 3
 
 
+def test_block_drafter_training_sampler_normal_fill_excludes_explicit_hard() -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.rank = 0
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={
+                    "dspark_hard_sample_ratio": 0.125,
+                }
+            )
+        )
+    )
+    items = [{"_verl_is_hard": True, "id": f"hard-{index}"} for index in range(32)]
+    items.extend({"_verl_is_hard": False, "id": f"normal-{index}"} for index in range(48))
+
+    selected = trainer._sample_training_items(items, 8, __import__("random").Random(1))
+
+    assert len(selected) == 8
+    assert sum(1 for item in selected if item["_verl_is_hard"]) == 1
+
+
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     calls: list[tuple[str, object, int]] = []
     waited: list[object] = []
