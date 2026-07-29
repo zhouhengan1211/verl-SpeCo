@@ -26,8 +26,6 @@ SPECO_VLLM_WORKER_EXTENSION_CLS = "verl_speco.integration.vllm_runtime.SpecoVLLM
 SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
-SPECO_VLLM_REQUEST_STATS_PRINT_ENV = "VERL_SPECO_VLLM_REQUEST_STATS_PRINT"
-SPECO_VLLM_REQUEST_STATS_LOG_PATH_ENV = "VERL_SPECO_VLLM_REQUEST_STATS_LOG_PATH"
 SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX = "_speco_vllm_request"
 SPECO_VLLM_REQUEST_STATS_TRACE_HEADER = "x-speco-vllm-request-accept-stats"
 _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID: dict[str, tuple[dict[str, dict[str, Any]], list[str]]] = {}
@@ -1279,46 +1277,9 @@ def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
         return
     request_ids = _request_ids_from_scheduler_output(output)
     if not request_ids:
-        missing_count = _int_or_zero(
-            getattr(scheduler, "_speco_vllm_request_missing_finished_ids_diag_count", 0)
-        ) + 1
-        scheduler._speco_vllm_request_missing_finished_ids_diag_count = missing_count
-        if missing_count <= 3 or (missing_count & (missing_count - 1)) == 0:
-            _log_vllm_request_stats_diag(
-                "missing_finished_request_ids",
-                {
-                    "pending_stats_count": len(stats),
-                    "pending_request_ids_head": list(stats.keys())[:8],
-                    "diag_count": missing_count,
-                    "suppressed_repeated_count": max(0, missing_count - 3),
-                },
-                output,
-            )
         return
     summaries, completion_order = _pop_vllm_request_stats_for_ids(scheduler, request_ids)
-    _log_vllm_request_stats_diag(
-        "attach_attempt",
-        {
-            "finished_request_count": len(request_ids),
-            "finished_request_ids_head": request_ids[:8],
-            "attached_summary_count": len(summaries),
-            "pending_stats_count_after_pop": len(stats),
-            "pending_request_ids_head_after_pop": list(stats.keys())[:8],
-            "record_call_count": _int_or_zero(getattr(scheduler, "_speco_vllm_request_accept_record_count", 0)),
-        },
-        output,
-    )
     if not summaries:
-        _log_vllm_request_stats_diag(
-            "no_matching_request_stats_for_finished_ids",
-            {
-                "finished_request_ids_head": request_ids[:8],
-                "finished_request_count": len(request_ids),
-                "pending_stats_count": len(stats),
-                "pending_request_ids_head": list(stats.keys())[:8],
-            },
-            output,
-        )
         return
     _set_vllm_request_stats_on_output(output, summaries, completion_order)
 
@@ -1402,21 +1363,6 @@ def patch_vllm_request_acceptance_stats() -> bool:
                         summary = summaries.get(request_id)
                         if summary is not None:
                             _attach_vllm_request_stats_to_trace_headers(engine_core_output, summary)
-                    if summaries:
-                        _log_vllm_request_stats_diag(
-                            "attach_engine_core_outputs",
-                            {
-                                "finished_request_count": len(finished_outputs),
-                                "attached_summary_count": len(summaries),
-                                "finished_request_ids_head": [
-                                    request_id for request_id, _ in finished_outputs[:8]
-                                ],
-                                "record_call_count": _int_or_zero(
-                                    getattr(self, "_speco_vllm_request_accept_record_count", 0)
-                                ),
-                            },
-                            None,
-                        )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Failed to attach vLLM request stats to EngineCoreOutputs: %s", exc)
             return engine_core_outputs
@@ -1718,66 +1664,9 @@ def _vllm_spec_decode_stats_to_metrics(stats: dict[str, float]) -> dict[str, flo
     }
 
 
-def _append_vllm_request_stats_log(records: list[dict[str, Any]], output: Any) -> None:
-    if not records:
-        return
-    path = os.getenv(SPECO_VLLM_REQUEST_STATS_LOG_PATH_ENV, "/tmp/speco_vllm_request_stats.jsonl")
-    if not path:
-        return
-    try:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        payload = {
-            "output_request_id": str(getattr(output, "request_id", "")),
-            "count": len(records),
-            "records": records,
-        }
-        with open(path, "a", encoding="utf-8") as file:
-            file.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Failed to append vLLM request acceptance stats log: %s", exc)
-
-
-def _log_vllm_request_stats_diag(event: str, payload: dict[str, Any], output: Any | None = None) -> None:
-    path = os.getenv(SPECO_VLLM_REQUEST_STATS_LOG_PATH_ENV, "/tmp/speco_vllm_request_stats.jsonl")
-    message = {
-        "event": event,
-        **payload,
-    }
-    if output is not None:
-        message["output_request_id"] = str(getattr(output, "request_id", ""))
-        message["output_type"] = type(output).__name__
-    if path:
-        try:
-            directory = os.path.dirname(path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as file:
-                file.write(json.dumps(message, ensure_ascii=True, separators=(",", ":")) + "\n")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed to append vLLM request stats diagnostic log: %s", exc)
-    if _bool_or_none(os.getenv(SPECO_VLLM_REQUEST_STATS_PRINT_ENV, "1")):
-        print(
-            "[speco vllm request stats diag] %s"
-            % json.dumps(message, ensure_ascii=True, separators=(",", ":")),
-            flush=True,
-        )
-
-
 def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
     summaries = getattr(output, "_speco_vllm_request_accept_stats", None)
     if not isinstance(summaries, dict) or not summaries:
-        completion_order = getattr(output, "_speco_vllm_request_completion_order", None)
-        if completion_order is not None or hasattr(output, "_speco_vllm_request_accept_stats"):
-            _log_vllm_request_stats_diag(
-                "missing_output_summaries",
-                {
-                    "completion_order_type": type(completion_order).__name__,
-                    "completion_order_len": len(completion_order) if isinstance(completion_order, (list, tuple)) else 0,
-                },
-                output,
-            )
         return {}
     completion_order = getattr(output, "_speco_vllm_request_completion_order", None)
     output_request_id = getattr(output, "request_id", None)
@@ -1795,7 +1684,6 @@ def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
     completion_indices = []
     mean_accept_len = []
     elapsed_sec = []
-    records = []
     for request_id in ordered_ids:
         item = summaries.get(request_id) or {}
         rounds = _int_or_zero(item.get("verify_rounds", 0))
@@ -1810,36 +1698,6 @@ def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
         completion_indices.append(_int_or_zero(item.get("completion_index", 0)))
         mean_accept_len.append(request_mean_accept_len)
         elapsed_sec.append(request_elapsed_sec)
-        records.append(
-            {
-                "request_id": str(request_id),
-                "completion_index": _int_or_zero(item.get("completion_index", 0)),
-                "completed_time": float(item["completed_time"])
-                if isinstance(item.get("completed_time"), (int, float))
-                else None,
-                "verify_rounds": rounds,
-                "draft_tokens": _int_or_zero(item.get("draft_tokens", 0)),
-                "accepted_tokens": accepted,
-                "mean_accept_len": round(float(request_mean_accept_len), 6)
-                if request_mean_accept_len is not None
-                else None,
-                "elapsed_sec": round(float(request_elapsed_sec), 6) if request_elapsed_sec is not None else None,
-            }
-        )
-    records.sort(
-        key=lambda record: (
-            record["completed_time"] is None,
-            record["completed_time"] if record["completed_time"] is not None else 0.0,
-            record["completion_index"],
-        )
-    )
-    _append_vllm_request_stats_log(records, output)
-    if _bool_or_none(os.getenv(SPECO_VLLM_REQUEST_STATS_PRINT_ENV, "1")):
-        print(
-            "[speco vllm request stats] count=%s records=%s"
-            % (len(records), json.dumps(records, ensure_ascii=True, separators=(",", ":"))),
-            flush=True,
-        )
     return {
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id": ordered_ids,
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_verify_rounds": verify_rounds,
@@ -1975,12 +1833,6 @@ class _SpecoVLLMHttpServerMixin:
                     _speco_vllm_request_completion_order=completion_order,
                 )
                 extra_fields.update(_vllm_request_accept_stats_to_scalar_extra_fields(proxy_output))
-        else:
-            _log_vllm_request_stats_diag(
-                "missing_output_extra_fields",
-                {"extra_fields_type": type(extra_fields).__name__},
-                output,
-            )
         return output
 
 
