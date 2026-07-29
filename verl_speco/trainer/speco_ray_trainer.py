@@ -314,13 +314,14 @@ def _speco_request_accept_len_step_payload(
     records: list[dict[str, Any]],
     accept_len_var: float,
 ) -> dict[str, Any] | None:
-    values = sorted(
+    values = [
         float(record["mean_accept_len"])
         for record in records
         if _speco_optional_float(record.get("mean_accept_len")) is not None
-    )
+    ]
     if not values:
         return None
+    sorted_values = sorted(values)
     bin_width = _speco_accept_len_hist_bin_width()
     mean_accept_len = sum(values) / len(values)
     return {
@@ -329,12 +330,12 @@ def _speco_request_accept_len_step_payload(
         "count": len(values),
         "accept_lens": [round(value, 6) for value in values],
         "summary": {
-            "min": round(values[0], 6),
-            "max": round(values[-1], 6),
+            "min": round(sorted_values[0], 6),
+            "max": round(sorted_values[-1], 6),
             "mean": round(mean_accept_len, 6),
-            "p50": round(float(_speco_accept_len_quantile(values, 0.50)), 6),
-            "p90": round(float(_speco_accept_len_quantile(values, 0.90)), 6),
-            "p95": round(float(_speco_accept_len_quantile(values, 0.95)), 6),
+            "p50": round(float(_speco_accept_len_quantile(sorted_values, 0.50)), 6),
+            "p90": round(float(_speco_accept_len_quantile(sorted_values, 0.90)), 6),
+            "p95": round(float(_speco_accept_len_quantile(sorted_values, 0.95)), 6),
             "var": round(float(accept_len_var), 6),
         },
         "histogram": {
