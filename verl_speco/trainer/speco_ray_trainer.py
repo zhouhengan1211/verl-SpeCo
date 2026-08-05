@@ -260,14 +260,22 @@ def _speco_diag_enabled(name: str, default: str = "1") -> bool:
 
 
 def _speco_append_jsonl(path: str | None, payload: dict[str, Any]) -> None:
+    _speco_append_jsonl_batch(path, [payload])
+
+
+def _speco_append_jsonl_batch(path: str | None, payloads: list[dict[str, Any]]) -> None:
     if not path:
+        return
+    if not payloads:
         return
     try:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         with open(path, "a", encoding="utf-8") as file:
-            file.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+            file.write(
+                "".join(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" for payload in payloads)
+            )
     except Exception as exc:  # noqa: BLE001
         logger.debug("Failed to append SPECO diagnostic log %s: %s", path, exc)
 
@@ -470,6 +478,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
         self._speco_last_oldlogprob_total_elapsed_sec = 0.0
         self._speco_last_collect_interval_matched = 0
+        self._speco_pending_request_accept_len_payloads = []
 
     def attach_speco_worker_group(self, worker_group):
         self.drafter_wg = worker_group
@@ -1109,11 +1118,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             result[index] = 1.0 + accepted_tokens / verify_rounds
         return result
 
-    def _speco_request_ids(self, batch: DataProto, batch_size: int) -> list[str]:
+    def _speco_request_ids(self, batch: DataProto, batch_size: int, *, require: bool = False) -> list[str]:
         non_tensor_batch = getattr(batch, "non_tensor_batch", None)
         if not isinstance(non_tensor_batch, dict):
+            if require:
+                raise RuntimeError("SPECO request acceptance stats require a non-tensor request id field")
             return [str(index) for index in range(batch_size)]
+        if require and _SPECO_VLLM_REQUEST_ID_KEY not in non_tensor_batch:
+            raise RuntimeError(f"SPECO request acceptance stats missing {_SPECO_VLLM_REQUEST_ID_KEY}")
         request_ids = _speco_sequence_values(non_tensor_batch.get(_SPECO_VLLM_REQUEST_ID_KEY), batch_size)
+        if require and any(value is None for value in request_ids):
+            raise RuntimeError("SPECO request acceptance stats contain a missing request id")
+        if require and len({str(value) for value in request_ids}) != batch_size:
+            raise RuntimeError("SPECO request acceptance stats contain duplicate request ids")
         return [str(value) if value is not None else str(index) for index, value in enumerate(request_ids)]
 
     def _speco_request_completion_indices(self, batch: DataProto, batch_size: int) -> list[int | None]:
@@ -1167,12 +1184,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_log_request_accept_len_variance_from_batch(self, batch: DataProto, *, source: str) -> bool:
         batch_size = self._speco_batch_size_from_request_stats(batch)
-        should_print = self._speco_should_log_request_accept_len_variance()
         if batch_size <= 0:
             return False
 
         request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
-        request_ids = self._speco_request_ids(batch, batch_size)
+        request_ids = self._speco_request_ids(batch, batch_size, require=True)
         request_completion_indices = self._speco_request_completion_indices(batch, batch_size)
         request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
         candidates = [
@@ -1198,23 +1214,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             accept_len_var=accept_len_var,
         )
         if payload:
-            path = os.getenv(
-                _SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH_ENV,
-                "/tmp/speco_vllm_request_accept_len_hist.jsonl",
-            )
-            _speco_append_jsonl(path, payload)
-            if _speco_diag_enabled(_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT_ENV, "0"):
-                print(
-                    "[speco request accept len hist] %s"
-                    % json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
-                    flush=True,
-                )
-        if should_print and records:
-            print(
-                "[speco request accept len] step=%s requests=%s request_accept_len_var=%.3f source=%s"
-                % (self.global_steps, len(records), accept_len_var, source),
-                flush=True,
-            )
+            self._speco_pending_request_accept_len_payloads.append(payload)
         return bool(records)
 
     def _speco_log_request_accept_lens(
@@ -1245,6 +1245,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "collected": bool(collect_mask[batch_idx].item()),
                 }
             )
+        # Keep completion-order sorting local to diagnostics; training uses the
+        # original batch-indexed request arrays below.
         records.sort(
             key=lambda item: (
                 item["completion_index"] is None,
@@ -1261,6 +1263,36 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_request_accept_len_records = records
         self._speco_last_request_accept_len_var = accept_len_var
         return records, accept_len_var
+
+    def _speco_flush_request_accept_len_payloads(self) -> None:
+        payloads = self._speco_pending_request_accept_len_payloads
+        if not payloads:
+            return
+        self._speco_pending_request_accept_len_payloads = []
+        path = os.getenv(
+            _SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH_ENV,
+            "/tmp/speco_vllm_request_accept_len_hist.jsonl",
+        )
+        _speco_append_jsonl_batch(path, payloads)
+        if _speco_diag_enabled(_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT_ENV, "0"):
+            for payload in payloads:
+                print(
+                    "[speco request accept len hist] %s"
+                    % json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                    flush=True,
+                )
+        if self._speco_should_log_request_accept_len_variance():
+            for payload in payloads:
+                print(
+                    "[speco request accept len] step=%s requests=%s request_accept_len_var=%.3f source=%s"
+                    % (
+                        payload["step"],
+                        payload["count"],
+                        payload["summary"]["var"],
+                        payload["source"],
+                    ),
+                    flush=True,
+                )
 
     def _speco_build_oldlogprob_collect_plan(self, batch: DataProto) -> dict[str, Any] | None:
         if not self._speco_oldlogprob_collection_enabled():
@@ -1315,7 +1347,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         prompt_lens: list[int] = []
         response_lens: list[int] = []
         request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
-        request_ids = self._speco_request_ids(batch, batch_size)
+        require_request_ids = any(value is not None for value in request_accept_lens)
+        request_ids = self._speco_request_ids(batch, batch_size, require=require_request_ids)
         request_completion_indices = self._speco_request_completion_indices(batch, batch_size)
         request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
         all_request_accept_len_candidates = [
@@ -1488,6 +1521,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "candidate_count": candidate_count,
             "owner_token_counts": owner_token_counts,
             "window_mode": window_mode,
+            "request_ids": request_ids,
             "request_mean_accept_len": mean_accept_len_tensor,
             "request_is_hard": is_hard,
             "request_hard_score": hard_score,
@@ -1583,6 +1617,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         request_hard_score = collect_plan.get("request_hard_score")
         request_completion_indices = collect_plan.get("request_completion_indices")
         request_elapsed_secs = collect_plan.get("request_elapsed_secs")
+        request_ids = collect_plan.get("request_ids")
         buckets = [[] for _ in range(int(collect_plan["owner_count"]))]
         collected_rows = 0
         payload_bytes = 0
@@ -1677,6 +1712,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "global_step": self.global_steps,
                 "replica_rank": owner,
             }
+            if isinstance(request_ids, (list, tuple)) and batch_idx < len(request_ids):
+                sample[_SPECO_VLLM_REQUEST_ID_KEY] = str(request_ids[batch_idx])
             if torch.is_tensor(request_mean_accept_len) and batch_idx < int(request_mean_accept_len.numel()):
                 mean_accept_len = float(request_mean_accept_len[batch_idx].item())
                 if math.isfinite(mean_accept_len):
@@ -2404,6 +2441,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 0.0,
                 metrics["timing_s/drafter"] - known_drafter_timing,
             )
+            self._speco_flush_request_accept_len_payloads()
             return self._speco_update_output_metrics(actor_output, metrics)
 
         def update_weights_with_speco(manager_self, *args, **kwargs):

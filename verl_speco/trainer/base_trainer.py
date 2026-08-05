@@ -256,6 +256,23 @@ def _batch_item_float(value: Any, index: int = 0) -> float | None:
         return None
 
 
+def _batch_item_value(value: Any, index: int = 0) -> Any:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        flat = value.detach().view(-1).cpu()
+        index = min(max(int(index), 0), flat.numel() - 1)
+        return flat[index].item()
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        index = min(max(int(index), 0), len(value) - 1)
+        return value[index]
+    return value
+
+
 def _tensor_sum_int(tensor: torch.Tensor) -> int:
     return int(tensor.detach().float().sum().cpu().item())
 
@@ -2269,6 +2286,7 @@ class DrafterBaseTrainer:
                     batch.get("_verl_request_mean_accept_len"),
                     i,
                 ),
+                "_speco_vllm_request_id": _batch_item_value(batch.get("_speco_vllm_request_id"), i),
                 "_speco_vllm_request_elapsed_sec": _batch_item_float(
                     batch.get("_speco_vllm_request_elapsed_sec"),
                     i,
