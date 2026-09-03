@@ -2092,6 +2092,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> int:
         if not collect_plan:
             return 0
+        training_cfg = self._speco_drafter_training_config()
+        hard_sampling_enabled = (
+            float(training_cfg.get("dspark_hard_candidate_ratio", 0.0) or 0.0) > 0.0
+            and float(training_cfg.get("dspark_hard_sample_ratio", 0.0) or 0.0) > 0.0
+        )
         hidden_states = tu.get(output, OLD_LOGPROB_HIDDEN_STATES_KEY)
         hidden_refs = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_REFS_KEY)
@@ -2255,7 +2260,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             ref_meta = self._speco_sequence_item(hidden_ref_meta, batch_idx)
             ref_chunks = sample_ref_chunks.get(batch_idx)
             if (
-                not ref_chunks
+                hard_sampling_enabled
+                and not ref_chunks
                 and hidden_ref is not None
                 and isinstance(ref_meta, dict)
                 and int(ref_meta.get("chunk_length", 0) or 0) > 0

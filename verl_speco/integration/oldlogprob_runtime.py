@@ -109,6 +109,21 @@ def _oldlogprob_enabled_from_drafter(drafter: Any) -> bool:
     )
 
 
+def _hard_sampling_enabled_from_config(config: Any) -> bool:
+    training = _get_nested(config, ("rollout", "drafter", "training"), None)
+    if training is None:
+        training = _get_nested(
+            config, ("actor_rollout_ref", "rollout", "drafter", "training"), {}
+        )
+    candidate_ratio = float(
+        _get_nested(training, ("dspark_hard_candidate_ratio",), 0.0) or 0.0
+    )
+    sample_ratio = float(
+        _get_nested(training, ("dspark_hard_sample_ratio",), 0.0) or 0.0
+    )
+    return candidate_ratio > 0.0 and sample_ratio > 0.0
+
+
 def oldlogprob_hidden_runtime_enabled(
     config: Any = None, *, drafter_env: str | None = None
 ) -> bool:
@@ -640,11 +655,14 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
                     speco_tensor[key] = source_dict.pop(key)
 
         final_output = postprocess_output(self, output, *args, **kwargs)
+        hard_sampling_enabled = _hard_sampling_enabled_from_config(
+            getattr(self, "config", None)
+        )
         if speco_non_tensor and final_output is not None:
             from verl.utils import tensordict_utils as tu
 
             for key, value in speco_non_tensor.items():
-                if key in (
+                if hard_sampling_enabled and key in (
                     OLD_LOGPROB_HIDDEN_REFS_KEY,
                     OLD_LOGPROB_HIDDEN_REF_META_KEY,
                 ) and isinstance(value, list):
@@ -654,7 +672,7 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
                     continue
                 # Global chunk lists retain one DP shard; their per-sample
                 # metadata above is sufficient to rebuild chunk descriptors.
-                if key in (
+                if hard_sampling_enabled and key in (
                     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
                     OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
                 ):
