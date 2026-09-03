@@ -14,11 +14,66 @@ export MALLOC_CONF="${MALLOC_CONF:-narenas:8,thp:never,metadata_thp:disabled,dir
 export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
-
+export PYTHONPATH=/efs_rl/z00876269/Speculative_Decoding/verl-SpeCo:$PYTHONPATH
+export PYTHONPATH=/efs_rl/z00876269/Speculative_Decoding/verl:$PYTHONPATH
+export PYTHONPATH=/efs_rl/z00876269/Speculative_Decoding/vllm-ascend:${PYTHONPATH}
 # NPU example for DSpark on vLLM-Ascend. SPECO keeps the user-facing
 # algorithm as DSPARK and maps it to vLLM's dflash speculative method.
-project_name='verl_grpo_example_dspark_drafter'
-exp_name='qwen3_8b_dspark_drafter_vllm_npu'
+# project_name='verl_grpo_example_dspark_drafter'
+# exp_name='qwen3_8b_dspark_drafter_vllm_npu'
+
+# export VERL_SPECO_VLLM_REQUEST_STATS_PRINT=0
+
+# 关闭 oldlogprob collect diag 控制台打印，包括:
+# [speco oldlogprob collect diag]
+# export VERL_SPECO_OLDLOGPROB_COLLECT_DIAG_PRINT=0
+
+# 每次实验只需要修改title
+title=${title:-"verl_release080_drafter_base"}
+project_name="verl_grpo_example_dspark_${title}"
+exp_name="qwen3_8b_dspark_${title}"
+
+LOG_TIME=$(date +"%Y%m%d_%H%M%S")
+LOG_DIR=${LOG_DIR:-/efs_rl/z00886395/log-speco/${LOG_TIME}}
+mkdir -p $LOG_DIR
+
+LOG_FILE="${LOG_DIR}/${exp_name}_${LOG_TIME}.log"
+cp $(readlink -f "$0") $LOG_DIR
+# export ASCEND_PROCESS_LOG_PATH=${LOG_DIR}/ascend_log
+
+REPO_DIR="/efs_rl/z00886395/codes/verl-SpeCo"
+GIT_LOG_FILE="${LOG_DIR}/speco_git_info.log"
+
+{
+    echo "========== Git Info =========="
+    echo "Time   : $(date '+%F %T')"
+    echo "Repo   : $(git -C "$REPO_DIR" rev-parse --show-toplevel)"
+    echo "Branch : $(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
+    echo "Commit : $(git -C "$REPO_DIR" rev-parse HEAD)"
+    echo "Date   : $(git -C "$REPO_DIR" log -1 --pretty=format:'%ad' --date=iso)"
+    echo "Message: $(git -C "$REPO_DIR" log -1 --pretty=format:'%s')"
+    echo "=============================="
+} > "$GIT_LOG_FILE"
+
+REPO_DIR="/verl"
+GIT_LOG_FILE="${LOG_DIR}/verl_git_info.log"
+
+{
+    echo "========== Git Info =========="
+    echo "Time   : $(date '+%F %T')"
+    echo "Repo   : $(git -C "$REPO_DIR" rev-parse --show-toplevel)"
+    echo "Branch : $(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
+    echo "Commit : $(git -C "$REPO_DIR" rev-parse HEAD)"
+    echo "Date   : $(git -C "$REPO_DIR" log -1 --pretty=format:'%ad' --date=iso)"
+    echo "Message: $(git -C "$REPO_DIR" log -1 --pretty=format:'%s')"
+    echo "=============================="
+} > "$GIT_LOG_FILE"
+
+# 每个 step 的平均接收长度分布文件
+# export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH=${LOG_DIR}/speco_vllm_request_accept_len_hist.jsonl
+
+# 所有 stdout/stderr 同时输出到屏幕和本地日志文件
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 gen_tp=2
 train_sp=4
@@ -26,25 +81,11 @@ ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
-
-# Request-level speculative acceptance statistics.
-REQUEST_ACCEPT_LEN_LOG_PATH=${REQUEST_ACCEPT_LEN_LOG_PATH:-./logs/${exp_name}_request_accept_len_hist.jsonl}
-mkdir -p "$(dirname "${REQUEST_ACCEPT_LEN_LOG_PATH}")"
-export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH="${REQUEST_ACCEPT_LEN_LOG_PATH}"
-# Disable printing of request-level speculative acceptance statistics to avoid cluttering the console output.
-export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT=0
-
-# Hard-sample presets (candidate ratio / training-batch ratio):
-# - Disable: 0.0 / 0.0
-# - Downsample hard requests: 0.4 / 0.1 (collect broadly, train with 10% hard samples)
-# - Strengthen hard requests: 0.5 / 0.5 (reserve half of collection/training for hard samples)
-DSPARK_HARD_CANDIDATE_RATIO=${DSPARK_HARD_CANDIDATE_RATIO:-0.4}
-DSPARK_HARD_SAMPLE_RATIO=${DSPARK_HARD_SAMPLE_RATIO:-0.1}
+MODEL_PATH=/efs_rl/z00886395/models/Qwen3-8B
+CKPTS_DIR=/efs_rl/z00886395/ckpts/checkpoints_dspark_${title}
+TRAIN_FILE=/efs_rl/z00886395/datasets/dapo-math-17k.parquet
+TEST_FILE=/efs_rl/z00886395/datasets/aime-2024.parquet
+DRAFTER_PATH=/efs_rl/z00886395/models/dspark_qwen3_8b_block7
 
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
@@ -58,8 +99,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.train_batch_size=64 \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
-    data.filter_overlong_prompts=True \
-    data.filter_overlong_prompts_workers=256 \
+    data.filter_overlong_prompts=False \
+    data.filter_overlong_prompts_workers=0 \
     data.truncation='error' \
     actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.model.path=${MODEL_PATH} \
@@ -104,17 +145,16 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=32 \
     actor_rollout_ref.rollout.drafter.training.dspark_max_window=512 \
-    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=full_vocab \
-    actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=4 \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=restricted_ce \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=7 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=256 \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=vanilla \
     actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
+    actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
+    actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.45 \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
-    actor_rollout_ref.rollout.drafter.training.dspark_hard_candidate_ratio=${DSPARK_HARD_CANDIDATE_RATIO} \
-    actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio=${DSPARK_HARD_SAMPLE_RATIO} \
-    actor_rollout_ref.rollout.drafter.training.request_accept_len_variance_interval_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
@@ -122,8 +162,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.max_collect_samples_per_step_per_replica=16 \
     actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=512 \
     actor_rollout_ref.rollout.drafter.training.max_collect_tokens_per_step_per_replica=16384 \
-    actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
-    actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
+    actor_rollout_ref.rollout.drafter.training.collect_interval_steps=10 \
+    actor_rollout_ref.rollout.drafter.training.training_interval_steps=10 \
     actor_rollout_ref.rollout.drafter.training.publish_async=True \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
     actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \
@@ -132,9 +172,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.draft_update_flush_after=True \
     actor_rollout_ref.rollout.load_format="auto" \
     actor_rollout_ref.actor.strategy=fsdp2 \
-    actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=8 \
-    actor_rollout_ref.rollout.drafter.training.sample_last_n_steps=8 \
-    actor_rollout_ref.rollout.drafter.training.train_batches_per_cycle=8 \
     algorithm.use_kl_in_reward=False \
     trainer.val_before_train=False \
     trainer.critic_warmup=0 \

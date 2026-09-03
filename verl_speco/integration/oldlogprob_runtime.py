@@ -644,6 +644,21 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
             from verl.utils import tensordict_utils as tu
 
             for key, value in speco_non_tensor.items():
+                if key in (
+                    OLD_LOGPROB_HIDDEN_REFS_KEY,
+                    OLD_LOGPROB_HIDDEN_REF_META_KEY,
+                ) and isinstance(value, list):
+                    # Preserve per-sample ObjectRef metadata as batch fields so
+                    # DataProto.concat retains all DP shards.
+                    tu.assign_non_tensor(final_output, **{key: value})
+                    continue
+                # Global chunk lists retain one DP shard; their per-sample
+                # metadata above is sufficient to rebuild chunk descriptors.
+                if key in (
+                    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+                    OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
+                ):
+                    continue
                 tu.assign_non_tensor_data(final_output, key, value)
         if speco_tensor and final_output is not None:
             from verl.utils import tensordict_utils as tu

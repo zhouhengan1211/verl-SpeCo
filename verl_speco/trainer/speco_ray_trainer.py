@@ -89,6 +89,7 @@ from verl_speco.trainer.scheduler import (
     DrafterScheduleConfig,
     DrafterScheduleContext,
     DrafterScheduler,
+    step_matches_interval,
     TrainingPlan,
 )
 from verl_speco.workers import SpecoWorker
@@ -1128,7 +1129,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         interval_steps = training_cfg.get(
             "request_accept_len_variance_interval_steps", 1
         )
-        return speco_step_matches_interval(self.global_steps, interval_steps)
+        return step_matches_interval(self.global_steps, interval_steps)
 
     def _speco_drafter_training_mode(self) -> str:
         training_cfg = self._speco_drafter_training_config()
@@ -1728,6 +1729,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         max_per_owner = collection_plan.max_samples_per_replica
         max_per_owner = max_per_owner if max_per_owner is not None else batch_size
         max_per_owner = max(max_per_owner, 0)
+        # Old-logprob hidden export is produced per log-prob micro batch. Keep
+        # the per-owner collection limit within that batch size so this path
+        # remains aligned with the interval/no-hard-sample baseline instead of
+        # expanding from 8 * 10 to 8 * configured_max(16).
+        rollout_cfg = _get_nested(
+            self.config, ("actor_rollout_ref", "rollout"), None
+        )
+        oldlogprob_micro_batch_size = _get_nested(
+            rollout_cfg, ("log_prob_micro_batch_size_per_gpu",), None
+        )
+        if oldlogprob_micro_batch_size is not None:
+            oldlogprob_micro_batch_size = max(
+                int(oldlogprob_micro_batch_size), 0
+            )
+            if oldlogprob_micro_batch_size > 0:
+                max_per_owner = min(max_per_owner, oldlogprob_micro_batch_size)
         max_tokens_per_owner = collection_plan.max_tokens_per_replica
         if max_tokens_per_owner is not None:
             max_tokens_per_owner = max(max_tokens_per_owner, 0)
@@ -1867,8 +1884,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             float(training_cfg.get("dspark_hard_candidate_ratio", 0.0) or 0.0), 0.0
         )
         hard_enabled = hard_sample_ratio > 0.0 and hard_candidate_ratio > 0.0
+        hard_added = 0
+        normal_added = 0
         if not hard_enabled:
-            add_round_robin(candidates)
+            normal_added = add_round_robin(candidates)
         else:
             if len(scored_candidates) < len(candidates):
                 logger.warning(
@@ -1926,20 +1945,78 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     hard_added,
                     target_hard,
                 )
-            selected_hard_ids = {
-                int(candidate["batch_idx"]) for candidate in selected_hard
-            }
             normal_candidates = [
                 candidate
                 for candidate in candidates
-                if int(candidate["batch_idx"]) not in selected_hard_ids
+                if not bool(collect_mask[int(candidate["batch_idx"])].item())
             ]
             normal_candidates.sort(
                 key=lambda candidate: self._speco_hash_fraction(
                     f"{candidate['sample_key']}:normal"
                 )
             )
-            add_round_robin(normal_candidates, start_owner=hard_added % owner_count)
+            normal_added = add_round_robin(
+                normal_candidates, start_owner=hard_added % owner_count
+            )
+            logger.warning(
+                "[speco hard selection] step=%s raw=%s eligible=%s scored=%s "
+                "sample_rate=%s owners=%s max_per_owner=%s "
+                "max_tokens_per_owner=%s capacity_per_owner=%s total_capacity=%s "
+                "hard_candidate_ratio=%s hard_sample_ratio=%s hard_pool=%s "
+                "target_hard=%s hard_added=%s normal_candidates=%s normal_added=%s "
+                "selected=%s owner_counts=%s",
+                self.global_steps,
+                candidate_count,
+                len(candidates),
+                len(scored_candidates),
+                sample_rate,
+                owner_count,
+                max_per_owner,
+                max_tokens_per_owner,
+                capacity_per_owner,
+                total_capacity,
+                hard_candidate_ratio,
+                hard_sample_ratio,
+                len(hard_pool),
+                target_hard,
+                hard_added,
+                len(normal_candidates),
+                normal_added,
+                selected_count,
+                owner_counts,
+            )
+
+        logger.warning(
+            "[speco collection selection] step=%s hard_enabled=%s "
+            "hard_candidate_ratio=%s hard_sample_ratio=%s raw=%s eligible=%s "
+            "owners=%s max_per_owner=%s max_tokens_per_owner=%s "
+            "hard_added=%s normal_added=%s selected=%s owner_counts=%s",
+            self.global_steps,
+            hard_enabled,
+            hard_candidate_ratio,
+            hard_sample_ratio,
+            candidate_count,
+            len(candidates),
+            owner_count,
+            max_per_owner,
+            max_tokens_per_owner,
+            hard_added,
+            normal_added,
+            selected_count,
+            owner_counts,
+        )
+        print(
+            "[speco collection selection] "
+            f"step={self.global_steps} hard_enabled={hard_enabled} "
+            f"hard_candidate_ratio={hard_candidate_ratio} "
+            f"hard_sample_ratio={hard_sample_ratio} raw={candidate_count} "
+            f"eligible={len(candidates)} owners={owner_count} "
+            f"max_per_owner={max_per_owner} "
+            f"max_tokens_per_owner={max_tokens_per_owner} "
+            f"hard_added={hard_added} normal_added={normal_added} "
+            f"selected={selected_count} owner_counts={owner_counts}",
+            flush=True,
+        )
 
         self._speco_log_request_accept_lens(
             candidates=all_request_accept_len_candidates,
@@ -2129,6 +2206,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ]
         collected_rows = 0
         payload_bytes = 0
+        planned_samples = int(collect_plan["selected_count"])
+        skipped_empty_positions = 0
+        skipped_missing_hidden = 0
+        skipped_empty_hidden = 0
         sample_ref_chunks: dict[int, list[dict[str, Any]]] = {}
         if isinstance(chunk_refs, (list, tuple)) and isinstance(
             chunk_meta, (list, tuple)
@@ -2184,10 +2265,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             valid_positions = hidden_positions[batch_idx].reshape(-1)
             valid_rows = int(valid_positions.numel())
             if valid_rows <= 0:
+                skipped_empty_positions += 1
                 continue
             hidden_ref = self._speco_sequence_item(hidden_refs, batch_idx)
             ref_meta = self._speco_sequence_item(hidden_ref_meta, batch_idx)
             ref_chunks = sample_ref_chunks.get(batch_idx)
+            if (
+                not ref_chunks
+                and hidden_ref is not None
+                and isinstance(ref_meta, dict)
+                and int(ref_meta.get("chunk_length", 0) or 0) > 0
+            ):
+                # The ObjectRef and its slice metadata are batch-shaped and
+                # therefore survive DataProto concatenation across every DP
+                # shard. Recreate the chunk descriptor here instead of relying
+                # on the global chunk lists, which are metadata and retain only
+                # one DP shard.
+                ref_chunks = [
+                    {
+                        "ref": hidden_ref,
+                        "chunk_index": int(ref_meta.get("chunk_index", 0) or 0),
+                        "chunk_start": int(ref_meta.get("chunk_start", 0) or 0),
+                        "chunk_length": int(ref_meta.get("chunk_length", 0) or 0),
+                        "chunk_row_indices": ref_meta.get("chunk_row_indices"),
+                        "dtype": ref_meta.get("dtype"),
+                        "shape": ref_meta.get("shape"),
+                    }
+                ]
             hidden = hidden_rows[batch_idx] if batch_idx < len(hidden_rows) else None
             if ref_chunks:
                 collected_rows += sum(
@@ -2201,9 +2305,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             elif hidden_ref is None:
                 if hidden is None:
+                    skipped_missing_hidden += 1
                     continue
                 hidden = hidden[:valid_rows].contiguous()
                 if hidden.numel() == 0:
+                    skipped_empty_hidden += 1
                     continue
                 collected_rows += int(hidden.size(0))
                 payload_bytes += int(hidden.numel()) * int(hidden.element_size())
@@ -2282,6 +2388,28 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             owners.append(owner)
 
         collected = len(samples)
+        missing_hidden_samples = max(planned_samples - collected, 0)
+        print(
+            "[speco oldlogprob payload] "
+            f"step={self.global_steps} planned={planned_samples} payload={collected} "
+            f"hidden_rows={len(hidden_rows)} "
+            f"hidden_refs={len(hidden_refs) if isinstance(hidden_refs, (list, tuple)) else 0} "
+            f"chunked_samples={len(sample_ref_chunks)} "
+            f"skip_empty_positions={skipped_empty_positions} "
+            f"skip_missing_hidden={skipped_missing_hidden} "
+            f"skip_empty_hidden={skipped_empty_hidden}",
+            flush=True,
+        )
+        if missing_hidden_samples:
+            logger.warning(
+                "[speco oldlogprob capture] step=%s candidates=%s planned=%s "
+                "payload=%s missing_hidden=%s",
+                self.global_steps,
+                int(collect_plan["candidate_count"]),
+                planned_samples,
+                collected,
+                missing_hidden_samples,
+            )
         if collected <= 0:
             return 0
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
@@ -2297,6 +2425,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         outcome = self._speco_execute_collection(
             collect_plan["collection_plan"],
             payload,
+        )
+        print(
+            "[speco oldlogprob outcome] "
+            f"step={self.global_steps} payload={collected} "
+            f"accepted={outcome.collected_samples} "
+            f"reason={outcome.reason} "
+            f"worker_results={len(outcome.worker_results or [])}",
+            flush=True,
         )
         self._speco_last_collected_samples = outcome.collected_samples
         self._speco_last_oldlogprob_collected_samples = outcome.collected_samples
