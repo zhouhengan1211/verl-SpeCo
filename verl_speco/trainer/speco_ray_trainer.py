@@ -1729,22 +1729,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         max_per_owner = collection_plan.max_samples_per_replica
         max_per_owner = max_per_owner if max_per_owner is not None else batch_size
         max_per_owner = max(max_per_owner, 0)
-        # Old-logprob hidden export is produced per log-prob micro batch. Keep
-        # the per-owner collection limit within that batch size so this path
-        # remains aligned with the interval/no-hard-sample baseline instead of
-        # expanding from 8 * 10 to 8 * configured_max(16).
-        rollout_cfg = _get_nested(
-            self.config, ("actor_rollout_ref", "rollout"), None
-        )
-        oldlogprob_micro_batch_size = _get_nested(
-            rollout_cfg, ("log_prob_micro_batch_size_per_gpu",), None
-        )
-        if oldlogprob_micro_batch_size is not None:
-            oldlogprob_micro_batch_size = max(
-                int(oldlogprob_micro_batch_size), 0
-            )
-            if oldlogprob_micro_batch_size > 0:
-                max_per_owner = min(max_per_owner, oldlogprob_micro_batch_size)
         max_tokens_per_owner = collection_plan.max_tokens_per_replica
         if max_tokens_per_owner is not None:
             max_tokens_per_owner = max(max_tokens_per_owner, 0)
